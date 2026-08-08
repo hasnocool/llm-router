@@ -1,0 +1,67 @@
+# llm-router configuration
+
+# Global routing strategy:
+#   "cloud-first" -> try cloud, fail over to local on error/timeout
+#   "local-first" -> try local, fail over to cloud on error/timeout
+strategy = "cloud-first"
+
+# Seconds to wait before treating a non-streaming call as failed (per provider).
+timeout_seconds = 60.0
+
+[providers.huggingface]
+name = "HuggingFace Serverless Inference"
+base_url = "https://router.huggingface.co/v1"
+default_model = "Qwen/Qwen3-8B"
+api_key_env = "HF_TOKEN"
+timeout_seconds = 120.0
+stream_timeout_seconds = 240.0
+
+[providers.local]
+name = "Local llama-server"
+base_url = "http://127.0.0.1:8081"
+default_model = "granite-3.3-2b-instruct"
+
+[providers.cerebras]
+name = "Cerebras Inference"
+base_url = "https://api.cerebras.ai/v1"
+default_model = "llama-3.3-70b"
+api_key_env = "CEREBRAS_API_KEY"
+timeout_seconds = 120.0
+stream_timeout_seconds = 240.0
+
+[providers.groq]
+name = "Groq"
+base_url = "https://api.groq.com/openai/v1"
+default_model = "llama-3.3-70b-versatile"
+api_key_env = "GROQ_API_KEY"
+timeout_seconds = 120.0
+stream_timeout_seconds = 240.0
+
+[providers.nvidia]
+name = "NVIDIA NIM"
+base_url = "https://integrate.api.nvidia.com/v1"
+default_model = "meta/llama-3.3-70b-instruct"
+api_key_env = "NVIDIA_API_KEY"
+timeout_seconds = 120.0
+stream_timeout_seconds = 240.0
+
+[providers.google_ai]
+name = "Google AI (Gemini)"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+default_model = "gemini-3.5-flash"
+api_key_env = "GOOGLE_AI_API_KEY"
+timeout_seconds = 120.0
+stream_timeout_seconds = 240.0
+# api_key_env omitted: llama-server has no auth
+
+# Model aliases clients can use. Value is "provider" + model id.
+# A "provider:" prefix in a client-supplied model string forces explicit routing.
+# Cloud aliases below were verified reachable on this HF account (free tier).
+[models]
+"qwen3-8b" = { provider = "huggingface", model = "Qwen/Qwen3-8B" }
+"qwen3-14b" = { provider = "huggingface", model = "Qwen/Qwen3-14B" }
+"qwen2.5-7b" = { provider = "huggingface", model = "Qwen/Qwen2.5-7B-Instruct" }
+"llama-3.1-8b" = { provider = "huggingface", model = "meta-llama/Llama-3.1-8B-Instruct" }
+"deepseek-r1-7b" = { provider = "huggingface", model = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" }
+"granite" = { provider = "local", model = "granite-3.3-2b-instruct" }
+"local" = { provider = "local", model = "granite-3.3-2b-instruct" }
