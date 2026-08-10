@@ -1,3 +1,4 @@
+# src/llm_router/config.py
 from __future__ import annotations
 
 import os
@@ -43,6 +44,9 @@ class MetricsConfig:
     flush_interval_seconds: int = 30
     retention_days: int = 30
     report_interval_seconds: int = 300
+    model_cache_ttl_seconds: int = 21_600
+    model_failure_backoff_seconds: int = 300
+    model_failure_backoff_max_seconds: int = 3_600
 
 
 @dataclass
@@ -55,6 +59,7 @@ class Settings:
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     host: str = "0.0.0.0"
     port: int = 8000
+    router_api_key: str | None = None
 
     def provider(self, name: str) -> ProviderConfig:
         try:
@@ -66,7 +71,6 @@ class Settings:
         return self.quotas.get(name)
 
     def resolve(self, model: str) -> tuple[str, str]:
-        """Resolve a client-supplied model string to (provider_name, model_id)."""
         if ":" in model:
             provider_hint, _, rest = model.partition(":")
             pname = normalize_provider(provider_hint)
@@ -85,6 +89,8 @@ def normalize_provider(name: str | None) -> str:
         "local": "local",
         "llama": "local",
         "llamacpp": "local",
+        "gemini": "google_ai",
+        "google": "google_ai",
     }
     return aliases.get(name.lower(), name.lower()) if name else ""
 
@@ -124,13 +130,14 @@ def load_settings(
         for alias, route in raw.get("models", {}).items()
     }
 
-    quotas = {}
-    for name, qc in raw.get("quotas", {}).items():
-        quotas[name] = QuotaConfig(
+    quotas = {
+        name: QuotaConfig(
             daily_request_limit=qc.get("daily_requests"),
             daily_token_limit=qc.get("daily_tokens"),
             quota_reset_hour=qc.get("reset_hour", 0),
         )
+        for name, qc in raw.get("quotas", {}).items()
+    }
 
     metrics_raw = raw.get("metrics", {})
     metrics = MetricsConfig(
@@ -138,6 +145,11 @@ def load_settings(
         flush_interval_seconds=metrics_raw.get("flush_interval_seconds", 30),
         retention_days=metrics_raw.get("retention_days", 30),
         report_interval_seconds=metrics_raw.get("report_interval_seconds", 300),
+        model_cache_ttl_seconds=metrics_raw.get("model_cache_ttl_seconds", 21_600),
+        model_failure_backoff_seconds=metrics_raw.get("model_failure_backoff_seconds", 300),
+        model_failure_backoff_max_seconds=metrics_raw.get(
+            "model_failure_backoff_max_seconds", 3_600
+        ),
     )
 
     return Settings(
@@ -149,4 +161,5 @@ def load_settings(
         metrics=metrics,
         host=env.get("HOST", "0.0.0.0"),
         port=int(env.get("PORT", "8000")),
+        router_api_key=env.get("ROUTER_API_KEY") or None,
     )
