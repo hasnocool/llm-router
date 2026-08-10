@@ -5,7 +5,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Sequence, TypeVar
 
 from .metrics_db import MetricsDB, QuotaConfig
 
@@ -75,7 +75,7 @@ class AsyncMetricsStore:
     async def record_request(self, **kwargs: Any) -> None:
         await self._call(lambda db: db.record_request(**kwargs))
 
-    async def upsert_rate_limits(self, provider: str, limits: list[object]) -> None:
+    async def upsert_rate_limits(self, provider: str, limits: Sequence[object]) -> None:
         if not limits:
             return
         await self._call(lambda db: db.upsert_rate_limits(provider, limits))
