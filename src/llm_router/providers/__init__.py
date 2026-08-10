@@ -8,7 +8,7 @@ from ..config import ProviderConfig
 from .base import Provider
 from .google_ai import GoogleAIProvider
 
-PROVIDER_CLASSES: dict[str, type] = {
+PROVIDER_CLASSES: dict[str, type[Provider]] = {
     "huggingface": Provider,
     "local": Provider,
     "cerebras": Provider,
@@ -30,7 +30,7 @@ def set_metrics_db(store: AsyncMetricsStore) -> None:
     set_metrics_store(store)
 
 
-def build_provider(name: str, config: ProviderConfig, http: httpx.AsyncClient) -> object:
+def build_provider(name: str, config: ProviderConfig, http: httpx.AsyncClient) -> Provider:
     cls = PROVIDER_CLASSES.get(name)
     if cls is None:
         raise ValueError(f"no provider class registered for {name!r}")
