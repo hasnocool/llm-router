@@ -3,7 +3,13 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from llm_router.config import ModelRoute, ProviderConfig, Settings, load_settings
+from llm_router.config import (
+    ConfigError,
+    ModelRoute,
+    ProviderConfig,
+    Settings,
+    load_settings,
+)
 from llm_router.providers.base import (
     ProviderRequestError,
     ProviderUnavailable,
@@ -335,3 +341,21 @@ class TestRoutingPool:
         ids = [m.id for m in models]
         assert "local-m" not in ids
         assert "m1" in ids and "m2" in ids
+        assert "local-alias" not in ids
+        assert "cloud-alias" in ids
+
+    def test_routing_pool_rejects_unknown_provider(self, tmp_path):
+        cfg = tmp_path / "config.toml"
+        cfg.write_text(
+            """
+[routing]
+providers = ["not-a-provider"]
+
+[providers.huggingface]
+base_url = "https://router.huggingface.co/v1"
+default_model = "Qwen/Qwen3-8B"
+api_key_env = "HF_TOKEN"
+"""
+        )
+        with pytest.raises(ConfigError):
+            load_settings(cfg, env={"HF_TOKEN": "hf_test"})

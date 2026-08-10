@@ -145,11 +145,15 @@ def load_settings(
     )
 
     routing_raw = raw.get("routing", {})
-    routing_providers = [
-        normalize_provider(name)
-        for name in routing_raw.get("providers", [])
-        if normalize_provider(name) in providers
-    ]
+    routing_providers = []
+    for name in routing_raw.get("providers", []):
+        normalized = normalize_provider(name)
+        if normalized not in providers:
+            raise ConfigError(
+                f"[routing] providers references unknown provider {name!r}; "
+                f"configured providers: {', '.join(providers)}"
+            )
+        routing_providers.append(normalized)
 
     return Settings(
         strategy=raw.get("strategy", "cloud-first"),

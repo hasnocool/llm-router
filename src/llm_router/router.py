@@ -256,7 +256,10 @@ class ModelRouter:
                 for s in ranked
                 if s.name in candidates and self.settings.provider(s.name).default_model
             ]
-            order_names += [n for n in candidates if n not in order_names]
+            order_names += [
+                n for n in candidates
+                if n not in order_names and self.settings.provider(n).default_model
+            ]
             if local_first:
                 order_names = sorted(order_names, key=lambda n: (n != "local",))
             return [
@@ -397,10 +400,11 @@ class ModelRouter:
                 out.append(
                     ModelInfo(id=f"{name}:{mid}" if name == "local" else mid, owned_by=name)
                 )
-        for alias in self.settings.models:
-            if alias not in seen:
-                seen.add(alias)
-                out.append(ModelInfo(id=alias, owned_by="router"))
+        for alias, route in self.settings.models.items():
+            if route.provider not in pool or alias in seen:
+                continue
+            seen.add(alias)
+            out.append(ModelInfo(id=alias, owned_by="router"))
         # Virtual "auto" model: routes to the best-ranked available provider.
         if "auto" not in seen:
             seen.add("auto")
