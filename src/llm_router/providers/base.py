@@ -1,14 +1,17 @@
+# src/llm_router/providers/base.py
 from __future__ import annotations
 
+import json
 import time
 from contextvars import ContextVar, Token
 from typing import Any, AsyncIterator
 
 import httpx
 
+from ..async_metrics import AsyncMetricsStore
 from ..config import ProviderConfig
-from ..metrics_db import get_metrics_db
-from ..rate_limits import RateLimitParser, extract_usage_from_response
+from ..metrics_db import QuotaLimitExceeded
+from ..rate_limits import RateLimitParser, extract_usage_from_response, retry_after_timestamp
 
 # HTTP statuses that indicate the provider is unavailable (retryable/failover).
 # 402 (payment required) is included so auto/fallback routing skips providers
@@ -49,16 +52,18 @@ def get_forwarded_request_headers() -> dict[str, str]:
 
 
 class ProviderUnavailable(Exception):
-    """Provider is down/overloaded — safe to fail over to another provider."""
-
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        retry_after_until: int | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after_until = retry_after_until
 
 
 class ProviderRequestError(Exception):
-    """Provider rejected the request — do NOT fail over."""
-
     def __init__(self, message: str, status_code: int | None = None, body: str = ""):
         super().__init__(message)
         self.status_code = status_code
@@ -66,11 +71,24 @@ class ProviderRequestError(Exception):
 
 
 class QuotaExceededError(ProviderRequestError):
-    """Provider quota exceeded — do NOT fail over, this is a hard limit."""
-
     def __init__(self, message: str, provider: str):
         super().__init__(message, status_code=429)
         self.provider = provider
+
+
+def estimate_request_tokens(payload: dict[str, Any]) -> int:
+    chars = 0
+    for message in payload.get("messages", []):
+        content = message.get("content", "") if isinstance(message, dict) else ""
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    chars += len(part["text"])
+    input_estimate = max(1, chars // 4) if chars else 0
+    output_estimate = int(payload.get("max_tokens") or payload.get("max_completion_tokens") or 0)
+    return input_estimate + max(0, output_estimate)
 
 
 class Provider:
@@ -79,12 +97,13 @@ class Provider:
         name: str,
         config: ProviderConfig,
         http: httpx.AsyncClient,
-        metrics_db=None,
+        metrics_store: AsyncMetricsStore | None = None,
+        metrics_db: AsyncMetricsStore | None = None,
     ):
         self.name = name
         self.config = config
         self._http = http
-        self._metrics_db = metrics_db or get_metrics_db()
+        self._metrics_store = metrics_store or metrics_db
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -101,6 +120,7 @@ class Provider:
             raise ProviderUnavailable(
                 f"{self.name} returned HTTP {resp.status_code}",
                 status_code=resp.status_code,
+                retry_after_until=retry_after_timestamp(resp.headers),
             )
         if resp.status_code >= 400:
             raise ProviderRequestError(
@@ -109,54 +129,90 @@ class Provider:
                 body=resp.text[:2000],
             )
 
-    def _check_quota(self) -> None:
-        """Check if daily quota is exceeded before making request."""
-        exceeded, msg = self._metrics_db.check_quota_exceeded(self.name)
-        if exceeded:
-            raise QuotaExceededError(f"{self.name}: {msg}", self.name)
-
-    def _record_rate_limits(self, headers: dict[str, str]) -> None:
-        """Parse and store rate limit headers from response."""
-        for rl in RateLimitParser.parse_for_provider(self.name, headers):
-            self._metrics_db.upsert_rate_limit(
-                provider=self.name,
-                limit_type=rl.limit_type,
-                limit_value=rl.limit_value,
-                remaining=rl.remaining,
-                reset_timestamp=rl.reset_timestamp,
-                header_source=rl.header_source,
+    async def _reserve_quota(self, payload: dict[str, Any]) -> str | None:
+        if self._metrics_store is None:
+            return None
+        try:
+            return await self._metrics_store.reserve_quota(
+                self.name, estimated_tokens=estimate_request_tokens(payload)
             )
+        except QuotaLimitExceeded as exc:
+            raise QuotaExceededError(f"{self.name}: {exc}", self.name) from exc
 
-    def _record_request_metrics(
+    async def _record_rate_limits(self, headers: dict[str, str]) -> None:
+        if self._metrics_store is None:
+            return
+        await self._metrics_store.upsert_rate_limits(
+            self.name, RateLimitParser.parse_for_provider(self.name, headers)
+        )
+
+    async def _record_attempt(
         self,
+        *,
+        reservation_id: str | None,
         success: bool,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         latency_ms: float = 0.0,
+        status_code: int | None = None,
+        request_kind: str = "inference",
     ) -> None:
-        """Record request metrics to database."""
-        self._metrics_db.record_request(
-            provider=self.name,
-            success=success,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            latency_ms=latency_ms,
+        if self._metrics_store is None:
+            return
+        await self._metrics_store.reconcile_reservation(
+            reservation_id,
+            self.name,
+            success,
+            prompt_tokens,
+            completion_tokens,
+            latency_ms,
+            status_code,
+            request_kind,
         )
 
     async def models(self) -> list[dict[str, Any]]:
-        t0 = time.time()
-        resp = await self._http.get(self._url("models"), headers=self._headers())
-        latency_ms = (time.time() - t0) * 1000
-        self._record_rate_limits(dict(resp.headers))
-        self._check_status(resp)
-        self._record_request_metrics(success=True, latency_ms=latency_ms)
-        data = resp.json()
+        t0 = time.perf_counter()
+        status_code: int | None = None
+        try:
+            resp = await self._http.get(
+                self._url("models"), headers=self._headers(), timeout=self.config.timeout_seconds
+            )
+            status_code = resp.status_code
+            await self._record_rate_limits(dict(resp.headers))
+            self._check_status(resp)
+            data = resp.json()
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+            await self._record_attempt(
+                reservation_id=None,
+                success=False,
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                status_code=status_code,
+                request_kind="model_discovery",
+            )
+            raise ProviderUnavailable(f"{self.name} unreachable: {exc}") from exc
+        except (ProviderUnavailable, ProviderRequestError):
+            await self._record_attempt(
+                reservation_id=None,
+                success=False,
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                status_code=status_code,
+                request_kind="model_discovery",
+            )
+            raise
+
+        await self._record_attempt(
+            reservation_id=None,
+            success=True,
+            latency_ms=(time.perf_counter() - t0) * 1000,
+            status_code=status_code,
+            request_kind="model_discovery",
+        )
         return data.get("data", [])
 
     async def complete(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Non-streaming chat completion. Returns the provider's JSON response."""
-        self._check_quota()
-        t0 = time.time()
+        reservation_id = await self._reserve_quota(payload)
+        t0 = time.perf_counter()
+        status_code: int | None = None
         try:
             resp = await self._http.post(
                 self._url("chat/completions"),
@@ -164,32 +220,46 @@ class Provider:
                 json=payload,
                 timeout=self.config.timeout_seconds,
             )
+            status_code = resp.status_code
+            await self._record_rate_limits(dict(resp.headers))
+            self._check_status(resp)
+            data = resp.json()
+            prompt_tokens, completion_tokens = extract_usage_from_response(data)
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
-            self._record_request_metrics(success=False, latency_ms=(time.time() - t0) * 1000)
+            await self._record_attempt(
+                reservation_id=reservation_id,
+                success=False,
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                status_code=status_code,
+            )
             raise ProviderUnavailable(f"{self.name} unreachable: {exc}") from exc
+        except (ProviderUnavailable, ProviderRequestError):
+            await self._record_attempt(
+                reservation_id=reservation_id,
+                success=False,
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                status_code=status_code,
+            )
+            raise
 
-        latency_ms = (time.time() - t0) * 1000
-        self._record_rate_limits(dict(resp.headers))
-        self._check_status(resp)
-
-        data = resp.json()
-        prompt_tokens, completion_tokens = extract_usage_from_response(data)
-        self._record_request_metrics(
+        await self._record_attempt(
+            reservation_id=reservation_id,
             success=True,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            latency_ms=latency_ms,
+            latency_ms=(time.perf_counter() - t0) * 1000,
+            status_code=status_code,
         )
         return data
 
     async def stream(self, payload: dict[str, Any]) -> AsyncIterator[str]:
-        """Streaming chat completion. Yields raw SSE lines (including blank lines)."""
-        self._check_quota()
-        t0 = time.time()
+        reservation_id = await self._reserve_quota(payload)
+        t0 = time.perf_counter()
         emitted = False
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-
+        prompt_tokens = 0
+        completion_tokens = 0
+        status_code: int | None = None
+        recorded = False
         try:
             async with self._http.stream(
                 "POST",
@@ -198,70 +268,66 @@ class Provider:
                 json=payload,
                 timeout=self.config.stream_timeout_seconds,
             ) as resp:
-                self._record_rate_limits(dict(resp.headers))
-
-                if resp.status_code in RETRYABLE_STATUSES:
-                    raise ProviderUnavailable(
-                        f"{self.name} returned HTTP {resp.status_code}",
-                        status_code=resp.status_code,
-                    )
-                if resp.status_code >= 400:
-                    body = await resp.aread()
-                    raise ProviderRequestError(
-                        f"{self.name} returned HTTP {resp.status_code}",
-                        status_code=resp.status_code,
-                        body=body.decode("utf-8", "replace")[:2000],
-                    )
-
+                status_code = resp.status_code
+                await self._record_rate_limits(dict(resp.headers))
+                self._check_status(resp)
                 async for line in resp.aiter_lines():
-                    if not emitted and line:
+                    if line:
                         emitted = True
-                        latency_ms = (time.time() - t0) * 1000
-
-                    # Extract token usage from streaming chunks
                     usage = self._extract_streaming_usage(line)
                     if usage:
-                        total_prompt_tokens += usage[0]
-                        total_completion_tokens += usage[1]
-
+                        prompt_tokens = max(prompt_tokens, usage[0])
+                        completion_tokens = max(completion_tokens, usage[1])
                     yield line
-
-                # Record metrics after successful stream completion
-                self._record_request_metrics(
-                    success=True,
-                    prompt_tokens=total_prompt_tokens,
-                    completion_tokens=total_completion_tokens,
-                    latency_ms=(time.time() - t0) * 1000,
-                )
-
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
-            latency_ms = (time.time() - t0) * 1000
-            self._record_request_metrics(
-                success=False,
-                prompt_tokens=total_prompt_tokens,
-                completion_tokens=total_completion_tokens,
-                latency_ms=latency_ms,
+            await self._record_attempt(
+                reservation_id=reservation_id,
+                success=True,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                status_code=status_code,
             )
+            recorded = True
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+            await self._record_attempt(
+                reservation_id=reservation_id,
+                success=False,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                status_code=status_code,
+            )
+            recorded = True
             if emitted:
                 raise
-            raise ProviderUnavailable(
-                f"{self.name} unreachable during stream: {exc}"
-            ) from exc
+            raise ProviderUnavailable(f"{self.name} unreachable during stream: {exc}") from exc
+        except (ProviderUnavailable, ProviderRequestError):
+            await self._record_attempt(
+                reservation_id=reservation_id,
+                success=False,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                status_code=status_code,
+            )
+            recorded = True
+            raise
+        finally:
+            if not recorded and self._metrics_store is not None:
+                await self._metrics_store.cancel_reservation(reservation_id)
 
-    def _extract_streaming_usage(self, line: str) -> tuple[int, int] | None:
-        """Extract token usage from streaming SSE line."""
+    @staticmethod
+    def _extract_streaming_usage(line: str) -> tuple[int, int] | None:
         if not line.startswith("data:"):
             return None
         payload = line[5:].strip()
         if not payload or payload == "[DONE]":
             return None
         try:
-            import json
-
             obj = json.loads(payload)
-            usage = obj.get("usage")
-            if usage:
-                return usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
-        except Exception:
-            pass
-        return None
+        except json.JSONDecodeError:
+            return None
+        usage = obj.get("usage")
+        if not usage:
+            return None
+        return int(usage.get("prompt_tokens", 0) or 0), int(usage.get("completion_tokens", 0) or 0)

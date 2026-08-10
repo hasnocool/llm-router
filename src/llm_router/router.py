@@ -1,20 +1,22 @@
+# src/llm_router/router.py
 from __future__ import annotations
 
 import asyncio
 import json
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 import httpx
 
+from .async_metrics import AsyncMetricsStore
 from .config import Settings, normalize_provider
-from .metrics_db import get_metrics_db
+from .metrics_db import QuotaConfig
 from .metrics_report import MetricsReportGenerator
-from .providers import build_provider, set_metrics_db
-from .providers.base import ProviderRequestError, ProviderUnavailable, QuotaExceededError
+from .providers import build_provider, set_metrics_store
+from .providers.base import Provider, ProviderRequestError, ProviderUnavailable, QuotaExceededError
 from .schemas import ChatMessage, ChatRequest, ChatResponse, ChatUsage, Choice, ModelInfo
 
 
@@ -26,7 +28,6 @@ class ProviderStatus:
     latency_ms: float = 0.0
     last_error: str = ""
     last_polled: float = 0.0
-    # Metrics fields
     daily_calls_used: int = 0
     daily_calls_remaining: int | None = None
     daily_tokens_used: int = 0
@@ -41,115 +42,86 @@ class ModelRouter:
     def __init__(self, settings: Settings, http: httpx.AsyncClient):
         self.settings = settings
         self._http = http
-        self.providers: dict[str, object] = {}
+        self.providers: dict[str, Provider] = {}
         self.status: dict[str, ProviderStatus] = {}
-        self._bg_tasks: list[asyncio.Task] = []
+        self._bg_tasks: list[asyncio.Task[Any]] = []
+        self._started = False
 
-        # Initialize metrics DB
-        from pathlib import Path
-        db_path = None
-        if settings.metrics.db_path:
-            db_path = Path(settings.metrics.db_path)
-        self._metrics_db = get_metrics_db(db_path=db_path)
-        set_metrics_db(self._metrics_db)
-
-        # Load quotas into metrics DB
-        for name, quota in settings.quotas.items():
-            from .metrics_db import QuotaConfig
-            self._metrics_db.upsert_quota(QuotaConfig(
-                provider_name=name,
-                daily_request_limit=quota.daily_request_limit,
-                daily_token_limit=quota.daily_token_limit,
-                quota_reset_hour=quota.quota_reset_hour,
-            ))
+        db_path = Path(settings.metrics.db_path) if settings.metrics.db_path else Path("metrics.db")
+        self._metrics_store = AsyncMetricsStore(db_path)
+        set_metrics_store(self._metrics_store)
 
         for name, cfg in settings.providers.items():
             self.providers[name] = build_provider(name, cfg, http)
             self.status[name] = ProviderStatus(name=name)
 
-        # Initialize metrics report generator
-        self._report_generator = MetricsReportGenerator(
-            report_path=(Path(settings.metrics.db_path).parent / "metrics_report.md") if settings.metrics.db_path else Path("metrics_report.md"),
-            config_path=(Path(settings.metrics.db_path).parent / "config.toml") if settings.metrics.db_path else None,
-        )
+        self._model_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._model_failures: dict[str, int] = {}
+        self._model_backoff_until: dict[str, float] = {}
+        self._report_path = db_path.parent / "metrics_report.md"
 
-    def start_background_tasks(self):
-        """Start background tasks for metrics polling and cleanup."""
-        flush_interval = self.settings.metrics.flush_interval_seconds
+    async def start_background_tasks(self) -> None:
+        """Start local-only maintenance tasks; no provider polling occurs here."""
+        if self._started:
+            return
+        await self._metrics_store.start()
+        for name, quota in self.settings.quotas.items():
+            await self._metrics_store.upsert_quota(
+                QuotaConfig(
+                    provider_name=name,
+                    daily_request_limit=quota.daily_request_limit,
+                    daily_token_limit=quota.daily_token_limit,
+                    quota_reset_hour=quota.quota_reset_hour,
+                )
+            )
+        await self.refresh_status_from_metrics()
         retention_days = self.settings.metrics.retention_days
-        report_interval = getattr(self.settings.metrics, 'report_interval_seconds', 300)  # Default 5 min
-        
-        self._bg_tasks.append(asyncio.create_task(self._poll_rate_limits_loop()))
+        report_interval = self.settings.metrics.report_interval_seconds
         self._bg_tasks.append(asyncio.create_task(self._cleanup_metrics_loop(retention_days)))
-        self._bg_tasks.append(asyncio.create_task(self._flush_metrics_loop(flush_interval)))
-        self._bg_tasks.append(asyncio.create_task(self._generate_report_loop(report_interval)))
+        if report_interval > 0:
+            self._bg_tasks.append(asyncio.create_task(self._generate_report_loop(report_interval)))
+        self._started = True
 
-    async def stop_background_tasks(self):
-        """Stop all background tasks."""
+    async def stop_background_tasks(self) -> None:
         for task in self._bg_tasks:
             task.cancel()
         await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         self._bg_tasks.clear()
+        await self._metrics_store.close()
+        self._started = False
 
-    async def _poll_rate_limits_loop(self):
-        """Periodically poll provider models endpoint to refresh rate limit headers."""
+    async def _cleanup_metrics_loop(self, retention_days: int) -> None:
         while True:
             try:
-                await asyncio.sleep(60)  # Poll every 60 seconds
-                await self.poll_all_providers()
+                await asyncio.sleep(3600)
+                await self._metrics_store.cleanup_old_metrics(retention_days)
             except asyncio.CancelledError:
                 break
-            except BaseException as e:
-                # Log but continue - don't crash the server
+            except Exception as exc:
                 import logging
-                logging.getLogger(__name__).warning(f"Rate limit poll failed: {e}")
+                logging.getLogger(__name__).warning("Metrics cleanup failed: %s", exc)
 
-    async def _cleanup_metrics_loop(self, retention_days: int):
-        """Periodically clean up old metrics data."""
-        while True:
-            try:
-                await asyncio.sleep(3600)  # Run every hour
-                self._metrics_db.cleanup_old_metrics(retention_days)
-            except asyncio.CancelledError:
-                break
-            except BaseException as e:
-                import logging
-                logging.getLogger(__name__).warning(f"Metrics cleanup failed: {e}")
-
-    async def _flush_metrics_loop(self, interval: int):
-        """Periodically ensure metrics are flushed (SQLite auto-commits, but good for explicit flush)."""
+    async def _generate_report_loop(self, interval: int) -> None:
         while True:
             try:
                 await asyncio.sleep(interval)
-                # SQLite commits on each transaction, but we can add explicit flush if needed
+                providers = list(self.providers)
+                report_path = self._report_path
+                await self._metrics_store.run_blocking(
+                    lambda db: MetricsReportGenerator(report_path, db).write_report(providers, days=7)
+                )
             except asyncio.CancelledError:
                 break
-            except BaseException as e:
+            except Exception as exc:
                 import logging
-                logging.getLogger(__name__).warning(f"Metrics flush failed: {e}")
+                logging.getLogger(__name__).warning("Report generation failed: %s", exc)
 
-    async def _generate_report_loop(self, interval: int):
-        """Periodically generate markdown metrics report."""
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info(f"Report generation loop started with interval {interval}s")
-        while True:
-            try:
-                await asyncio.sleep(interval)
-                logger.info("Generating metrics report...")
-                self._report_generator.write_report(days=7)
-                logger.info("Metrics report generated successfully")
-            except asyncio.CancelledError:
-                break
-            except BaseException as e:
-                logger.warning(f"Report generation failed: {e}")
-
-    def _enrich_status_with_metrics(self, name: str) -> None:
-        """Add metrics data to provider status."""
-        today = self._metrics_db.get_today_metrics(name)
-        quota_remaining = self._metrics_db.get_remaining_quota(name)
-        rate_limit = self._metrics_db.get_rate_limit(name)
-
+    async def _enrich_status_with_metrics(self, name: str) -> None:
+        today, quota_remaining, rate_limits = await asyncio.gather(
+            self._metrics_store.get_today_metrics(name),
+            self._metrics_store.get_remaining_quota(name),
+            self._metrics_store.get_rate_limits(name),
+        )
         status = self.status[name]
         if today:
             status.daily_calls_used = today.api_calls_total
@@ -158,60 +130,101 @@ class ModelRouter:
             status.latency_p99_ms = today.latency_p99_ms
         status.daily_calls_remaining = quota_remaining.get("requests_remaining")
         status.daily_tokens_remaining = quota_remaining.get("tokens_remaining")
-        if rate_limit:
-            status.rate_limit_remaining = rate_limit.remaining
-            status.rate_limit_reset = rate_limit.reset_timestamp
+        active_limits = [
+            item
+            for item in rate_limits
+            if item.remaining is not None
+            and (item.reset_timestamp is None or item.reset_timestamp > int(time.time()))
+        ]
+        if active_limits:
+            tightest = min(active_limits, key=lambda item: item.remaining if item.remaining is not None else 0)
+            status.rate_limit_remaining = tightest.remaining
+            status.rate_limit_reset = tightest.reset_timestamp
+        else:
+            status.rate_limit_remaining = None
+            status.rate_limit_reset = None
 
-    # --- availability polling ------------------------------------------
+    async def refresh_status_from_metrics(self) -> dict[str, ProviderStatus]:
+        """Refresh cached state without making provider network requests."""
+        await asyncio.gather(*(self._enrich_status_with_metrics(name) for name in self.providers))
+        return self.status
 
     async def poll_all_providers(self) -> dict[str, ProviderStatus]:
-        """Poll each provider's models endpoint concurrently. Update status."""
-        now = time.time()
+        """Explicit remote discovery probe, retained for diagnostics/tests only."""
         results = await asyncio.gather(
-            *(self._poll_one(name) for name in self.providers),
+            *(self._refresh_models_for_provider(name, force=True) for name in self.providers),
             return_exceptions=True,
         )
         for name, result in zip(self.providers, results):
-            if isinstance(result, Exception):
-                self.status[name].available = False
-                self.status[name].last_error = str(result)
-                self.status[name].last_polled = now
-            else:
-                self.status[name] = result
-            # Enrich with metrics
-            self._enrich_status_with_metrics(name)
+            if isinstance(result, BaseException):
+                self._mark_provider_failure(name, result)
+        await self.refresh_status_from_metrics()
         return self.status
 
-    async def _poll_one(self, name: str) -> ProviderStatus:
+    def _model_cache_fresh(self, name: str, now: float) -> bool:
+        cached = self._model_cache.get(name)
+        return bool(cached and now - cached[0] < self.settings.metrics.model_cache_ttl_seconds)
+
+    async def _refresh_models_for_provider(
+        self, name: str, *, force: bool = False
+    ) -> list[dict[str, Any]]:
+        now = time.time()
+        if not force and self._model_cache_fresh(name, now):
+            return self._model_cache[name][1]
+        if not force and now < self._model_backoff_until.get(name, 0.0):
+            return self._model_cache.get(name, (0.0, []))[1]
+
         provider = self.providers[name]
-        s = ProviderStatus(name=name)
-        t0 = time.time()
+        t0 = time.perf_counter()
         try:
-            data = await provider.models()
-            s.available = True
-            s.model_count = len(data)
-        except ProviderRequestError as exc:
-            s.available = False
-            s.last_error = f"HTTP {exc.status_code}: {exc.body[:120]}"
-        except ProviderUnavailable as exc:
-            s.available = False
-            s.last_error = str(exc)
-        except Exception as exc:
-            s.available = False
-            s.last_error = str(exc)[:200]
-        s.latency_ms = (time.time() - t0) * 1000
-        s.last_polled = time.time()
-        return s
+            models = await provider.models()
+        except (ProviderUnavailable, ProviderRequestError) as exc:
+            failures = self._model_failures.get(name, 0) + 1
+            self._model_failures[name] = failures
+            backoff = min(
+                self.settings.metrics.model_failure_backoff_max_seconds,
+                self.settings.metrics.model_failure_backoff_seconds * (2 ** min(failures - 1, 6)),
+            )
+            self._model_backoff_until[name] = now + backoff
+            self._mark_provider_failure(name, exc)
+            cached = self._model_cache.get(name)
+            if cached:
+                return cached[1]
+            raise
+
+        self._model_failures[name] = 0
+        self._model_backoff_until[name] = 0.0
+        self._model_cache[name] = (now, models)
+        status = self.status[name]
+        status.available = True
+        status.model_count = len(models)
+        status.latency_ms = (time.perf_counter() - t0) * 1000
+        status.last_error = ""
+        status.last_polled = time.time()
+        return models
+
+    def _mark_provider_success(self, name: str, latency_ms: float) -> None:
+        status = self.status[name]
+        status.available = True
+        status.latency_ms = latency_ms
+        status.last_error = ""
+        status.last_polled = time.time()
+
+    def _mark_provider_failure(self, name: str, exc: BaseException) -> None:
+        status = self.status[name]
+        status.last_error = str(exc)[:200]
+        status.last_polled = time.time()
+        if not isinstance(exc, ProviderUnavailable) or exc.status_code != 429:
+            status.available = False
 
     def ranked_providers(self) -> list[ProviderStatus]:
-        """Return providers sorted by availability then model count (descending)."""
         return sorted(
             self.status.values(),
-            key=lambda s: (s.available, s.model_count),
+            key=lambda status: (status.available, status.model_count, -status.latency_ms),
             reverse=True,
         )
 
-    # --- routing ------------------------------------------------------
+# --- routing ------------------------------------------------------
 
     def _routing_pool(self) -> list[str]:
         """Providers eligible for automatic/fallback routing (not explicit requests)."""
@@ -220,14 +233,8 @@ class ModelRouter:
         return list(self.providers.keys())
 
     def _order(self, req: ChatRequest) -> list[tuple[str, str]]:
-        """Return ordered [(provider_name, model_id)] to attempt."""
-        local_first = (
-            req.local_first
-            if req.local_first is not None
-            else self.settings.strategy == "local-first"
-        )
+        local_first = req.local_first if req.local_first is not None else self.settings.strategy == "local-first"
         available = list(self.providers.keys())
-
         colon_provider = req.model.partition(":")[0] if ":" in req.model else None
         explicit = req.provider or (
             colon_provider if normalize_provider(colon_provider) in self.providers else None
@@ -279,18 +286,18 @@ class ModelRouter:
             if s.name != primary and s.name in available and s.name in pool:
                 order_names.append(s.name)
         if local_first:
-            order_names = sorted(order_names, key=lambda n: (n != "local",))
+            order_names = sorted(order_names, key=lambda name: name != "local")
         return [
-            (n, model if n == primary else self.settings.provider(n).default_model)
-            for n in order_names if n in available
+            (name, model if name == primary else self.settings.provider(name).default_model)
+            for name in order_names
+            if name in available
         ]
 
-    def _payload(self, req: ChatRequest, model: str) -> dict:
+    @staticmethod
+    def _payload(req: ChatRequest, model: str) -> dict[str, Any]:
         payload = req.model_dump(exclude={"provider", "local_first"}, exclude_none=True)
         payload["model"] = model
         return payload
-
-    # --- non-streaming ------------------------------------------------
 
     async def complete(self, req: ChatRequest) -> ChatResponse:
         errors: list[str] = []
@@ -299,76 +306,77 @@ class ModelRouter:
             raise ProviderUnavailable("no providers configured")
         for name, model in order:
             provider = self.providers[name]
+            t0 = time.perf_counter()
             try:
                 data = await provider.complete(self._payload(req, model))
             except QuotaExceededError as exc:
-                # Quota exceeded - don't failover, return error directly
+                self._mark_provider_failure(name, exc)
                 raise ProviderRequestError(str(exc), status_code=429) from exc
             except ProviderUnavailable as exc:
+                self._mark_provider_failure(name, exc)
                 errors.append(f"{name}: {exc}")
                 continue
+            self._mark_provider_success(name, (time.perf_counter() - t0) * 1000)
+            await self._enrich_status_with_metrics(name)
             return self._to_response(data, model, provider_name=name)
         raise ProviderUnavailable("all providers failed: " + "; ".join(errors))
 
-    def _to_response(self, data: dict, model: str, provider_name: str) -> ChatResponse:
+    def _to_response(self, data: dict[str, Any], model: str, provider_name: str) -> ChatResponse:
         choice = data["choices"][0]
         msg = choice.get("message") or {"role": "assistant", "content": ""}
         usage = data.get("usage")
+        raw_tool_calls = msg.get("tool_calls")
+        tool_calls = raw_tool_calls if isinstance(raw_tool_calls, list) else None
         return ChatResponse(
             id=data.get("id") or f"chatcmpl-{uuid.uuid4().hex[:12]}",
             created=data.get("created") or int(time.time()),
             model=model,
-            choices=[
-                Choice(
-                    index=choice.get("index", 0),
-                    message=ChatMessage(
-                        role=msg.get("role", "assistant"),
-                        content=msg.get("content") or "",
-                        reasoning_content=msg.get("reasoning_content"),
-                    ),
-                    finish_reason=choice.get("finish_reason", "stop"),
-                )
-            ],
-            usage=(
-                ChatUsage(
-                    prompt_tokens=usage.get("prompt_tokens", 0),
-                    completion_tokens=usage.get("completion_tokens", 0),
-                    total_tokens=usage.get("total_tokens", 0),
-                )
-                if usage
-                else None
-            ),
+            choices=[Choice(
+                index=choice.get("index", 0),
+                message=ChatMessage(
+                    role=msg.get("role", "assistant"),
+                    content=msg.get("content"),
+                    reasoning_content=msg.get("reasoning_content"),
+                    tool_calls=tool_calls,
+                ),
+                finish_reason=choice.get("finish_reason", "stop"),
+            )],
+            usage=(ChatUsage(
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0),
+            ) if isinstance(usage, dict) else None),
             provider=provider_name,
         )
 
-    # --- streaming ----------------------------------------------------
-
     async def stream(self, req: ChatRequest) -> AsyncIterator[str]:
-        """Yields raw SSE lines for the first working provider."""
         errors: list[str] = []
         order = self._order(req)
         if not order:
             raise ProviderUnavailable("no providers configured")
         for idx, (name, model) in enumerate(order):
             provider = self.providers[name]
+            t0 = time.perf_counter()
             try:
                 async for line in provider.stream(self._payload(req, model)):
                     yield self._annotate_sse(line, name)
+                self._mark_provider_success(name, (time.perf_counter() - t0) * 1000)
+                await self._enrich_status_with_metrics(name)
                 return
             except QuotaExceededError as exc:
-                # Quota exceeded - don't failover, return error directly
+                self._mark_provider_failure(name, exc)
                 raise ProviderRequestError(str(exc), status_code=429) from exc
-            except ProviderRequestError as exc:
+            except ProviderRequestError:
                 raise
             except ProviderUnavailable as exc:
+                self._mark_provider_failure(name, exc)
                 errors.append(f"{name}: {exc}")
                 if idx < len(order) - 1:
                     continue
-                raise ProviderUnavailable(
-                    "all providers failed: " + "; ".join(errors)
-                ) from exc
+                raise ProviderUnavailable("all providers failed: " + "; ".join(errors)) from exc
 
-    def _annotate_sse(self, line: str, provider_name: str) -> str:
+    @staticmethod
+    def _annotate_sse(line: str, provider_name: str) -> str:
         if line.startswith("data:"):
             payload = line[5:].strip()
             if payload and payload != "[DONE]":
@@ -380,19 +388,18 @@ class ModelRouter:
                     return line
         return line
 
-    # --- model discovery ----------------------------------------------
-
-    async def list_models(self) -> list[ModelInfo]:
+    async def list_models(self, *, force_refresh: bool = False) -> list[ModelInfo]:
+        pool = self._routing_pool() or list(self.providers.keys())
+        results = await asyncio.gather(
+            *(self._refresh_models_for_provider(name, force=force_refresh) for name in pool),
+            return_exceptions=True,
+        )
         out: list[ModelInfo] = []
         seen: set[str] = set()
-        pool = self._routing_pool() or list(self.providers.keys())
-        for name in pool:
-            provider = self.providers[name]
-            try:
-                data = await provider.models()
-            except (ProviderUnavailable, ProviderRequestError):
+        for name, result in zip(pool, results):
+            if isinstance(result, BaseException):
                 continue
-            for item in data:
+            for item in result:
                 mid = item.get("id", "")
                 if not mid or mid in seen:
                     continue
@@ -417,44 +424,54 @@ class ModelRouter:
             )
         return out
 
-    # --- metrics endpoints --------------------------------------------
-
-    def get_provider_metrics(self, provider: str, days: int = 7) -> dict[str, Any]:
-        """Get detailed metrics for a specific provider."""
-        daily = self._metrics_db.get_daily_metrics(provider, days)
-        today = self._metrics_db.get_today_metrics(provider)
-        quota_remaining = self._metrics_db.get_remaining_quota(provider)
-        rate_limit = self._metrics_db.get_rate_limit(provider)
-
+    async def get_provider_metrics(self, provider: str, days: int = 7) -> dict[str, Any]:
+        daily, today, quota_remaining, rate_limits = await asyncio.gather(
+            self._metrics_store.get_daily_metrics(provider, days),
+            self._metrics_store.get_today_metrics(provider),
+            self._metrics_store.get_remaining_quota(provider),
+            self._metrics_store.get_rate_limits(provider),
+        )
+        active = [
+            item for item in rate_limits
+            if item.remaining is not None
+            and (item.reset_timestamp is None or item.reset_timestamp > int(time.time()))
+        ]
+        tightest = min(
+            active,
+            key=lambda item: item.remaining if item.remaining is not None else 0,
+        ) if active else None
         return {
             "provider": provider,
             "daily_calls_used": today.api_calls_total if today else 0,
             "daily_calls_remaining": quota_remaining.get("requests_remaining"),
             "daily_tokens_used": today.total_tokens if today else 0,
             "daily_tokens_remaining": quota_remaining.get("tokens_remaining"),
-            "rate_limit_remaining": rate_limit.remaining if rate_limit else None,
-            "rate_limit_reset": rate_limit.reset_timestamp if rate_limit else None,
-            "rate_limit_type": rate_limit.limit_type if rate_limit else None,
-            "latency_p50_ms": today.latency_p50_ms if today else 0,
-            "latency_p99_ms": today.latency_p99_ms if today else 0,
-            "history": [
-                {
-                    "date": d.metric_date.isoformat(),
-                    "calls": d.api_calls_total,
-                    "failed": d.api_calls_failed,
-                    "prompt_tokens": d.prompt_tokens,
-                    "completion_tokens": d.completion_tokens,
-                    "total_tokens": d.total_tokens,
-                    "latency_p50_ms": d.latency_p50_ms,
-                    "latency_p99_ms": d.latency_p99_ms,
-                }
-                for d in daily
-            ],
+            "rate_limit_remaining": tightest.remaining if tightest else None,
+            "rate_limit_reset": tightest.reset_timestamp if tightest else None,
+            "rate_limit_type": tightest.limit_type if tightest else None,
+            "rate_limits": [{
+                "type": item.limit_type,
+                "limit": item.limit_value,
+                "remaining": item.remaining,
+                "reset": item.reset_timestamp,
+                "source": item.header_source,
+            } for item in rate_limits],
+            "latency_p50_ms": today.latency_p50_ms if today else 0.0,
+            "latency_p99_ms": today.latency_p99_ms if today else 0.0,
+            "history": [{
+                "date": item.metric_date.isoformat(),
+                "calls": item.api_calls_total,
+                "failed": item.api_calls_failed,
+                "prompt_tokens": item.prompt_tokens,
+                "completion_tokens": item.completion_tokens,
+                "total_tokens": item.total_tokens,
+                "latency_p50_ms": item.latency_p50_ms,
+                "latency_p99_ms": item.latency_p99_ms,
+            } for item in daily],
         }
 
-    def get_all_metrics(self, days: int = 7) -> dict[str, Any]:
-        """Get metrics for all providers."""
-        return {
-            provider: self.get_provider_metrics(provider, days)
-            for provider in self.providers
-        }
+    async def get_all_metrics(self, days: int = 7) -> dict[str, Any]:
+        values = await asyncio.gather(
+            *(self.get_provider_metrics(provider, days) for provider in self.providers)
+        )
+        return dict(zip(self.providers, values))

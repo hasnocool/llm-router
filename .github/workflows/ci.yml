@@ -1,0 +1,30 @@
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install project and QA tools
+        run: python -m pip install -e '.[dev]' ruff pyright
+      - name: Compile
+        run: python -m compileall -q src tests
+      - name: Ruff critical checks
+        run: ruff check src tests --select E9,F63,F7,F82
+      - name: Tests
+        run: pytest -q
+      - name: Pyright
+        run: pyright src
