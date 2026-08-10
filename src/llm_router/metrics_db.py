@@ -1,18 +1,18 @@
+# src/llm_router/metrics_db.py
 from __future__ import annotations
 
-import os
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Iterable
 
 
 SCHEMA = """
--- Daily aggregated metrics per provider
 CREATE TABLE IF NOT EXISTS provider_daily_metrics (
     provider_name TEXT NOT NULL,
     metric_date DATE NOT NULL,
@@ -27,18 +27,17 @@ CREATE TABLE IF NOT EXISTS provider_daily_metrics (
     PRIMARY KEY (provider_name, metric_date)
 );
 
--- Current rate limit state (polled from provider headers)
-CREATE TABLE IF NOT EXISTS provider_rate_limits (
-    provider_name TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS provider_rate_limit_windows (
+    provider_name TEXT NOT NULL,
     limit_type TEXT NOT NULL,
     limit_value INTEGER,
     remaining INTEGER,
     reset_timestamp INTEGER,
     header_source TEXT,
-    last_polled TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    last_polled TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (provider_name, limit_type)
 );
 
--- Configured daily quotas (from config.toml)
 CREATE TABLE IF NOT EXISTS provider_quotas (
     provider_name TEXT PRIMARY KEY,
     daily_request_limit INTEGER,
@@ -47,10 +46,41 @@ CREATE TABLE IF NOT EXISTS provider_quotas (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Index for time-range queries
-CREATE INDEX IF NOT EXISTS idx_daily_metrics_date ON provider_daily_metrics(metric_date);
-CREATE INDEX IF NOT EXISTS idx_daily_metrics_provider ON provider_daily_metrics(provider_name);
+CREATE TABLE IF NOT EXISTS provider_request_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_name TEXT NOT NULL,
+    occurred_at REAL NOT NULL,
+    success INTEGER NOT NULL,
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    latency_ms REAL DEFAULT 0,
+    status_code INTEGER,
+    request_kind TEXT NOT NULL DEFAULT 'inference'
+);
+
+CREATE TABLE IF NOT EXISTS provider_quota_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    provider_name TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    reserved_requests INTEGER NOT NULL DEFAULT 1,
+    reserved_tokens INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_metrics_date
+    ON provider_daily_metrics(metric_date);
+CREATE INDEX IF NOT EXISTS idx_daily_metrics_provider
+    ON provider_daily_metrics(provider_name);
+CREATE INDEX IF NOT EXISTS idx_request_events_provider_time
+    ON provider_request_events(provider_name, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_quota_reservations_provider
+    ON provider_quota_reservations(provider_name, expires_at);
 """
+
+
+class QuotaLimitExceeded(RuntimeError):
+    """Raised when a local quota reservation would cross a configured limit."""
 
 
 @dataclass
@@ -64,14 +94,32 @@ class DailyMetrics:
     total_tokens: int = 0
     latency_sum_ms: float = 0.0
     latency_count: int = 0
+    latency_samples: tuple[float, ...] = field(default_factory=tuple)
+
+    @staticmethod
+    def _percentile(samples: tuple[float, ...], percentile: float) -> float:
+        if not samples:
+            return 0.0
+        ordered = sorted(samples)
+        if len(ordered) == 1:
+            return float(ordered[0])
+        pos = (len(ordered) - 1) * percentile
+        lower = int(pos)
+        upper = min(lower + 1, len(ordered) - 1)
+        fraction = pos - lower
+        return float(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction)
 
     @property
     def latency_p50_ms(self) -> float:
+        if self.latency_samples:
+            return self._percentile(self.latency_samples, 0.50)
         return self.latency_sum_ms / self.latency_count if self.latency_count else 0.0
 
     @property
     def latency_p99_ms(self) -> float:
-        return self.latency_p50_ms * 2.5 if self.latency_count else 0.0
+        if self.latency_samples:
+            return self._percentile(self.latency_samples, 0.99)
+        return self.latency_p50_ms if self.latency_count else 0.0
 
 
 @dataclass
@@ -94,6 +142,8 @@ class QuotaConfig:
 
 
 class MetricsDB:
+    """Blocking SQLite implementation. Call it only through AsyncMetricsStore at runtime."""
+
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self._local = threading.local()
@@ -101,27 +151,114 @@ class MetricsDB:
 
     def _get_conn(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn"):
-            self._local.conn = sqlite3.connect(
-                self.db_path, check_same_thread=False, timeout=30.0
-            )
-            self._local.conn.row_factory = sqlite3.Row
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            self._local.conn = conn
         return self._local.conn
 
-    def _init_db(self):
+    def _init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._get_conn()
         conn.executescript(SCHEMA)
         conn.commit()
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, *, immediate: bool = False):
         conn = self._get_conn()
         try:
+            if immediate:
+                conn.execute("BEGIN IMMEDIATE")
             yield conn
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+
+    @staticmethod
+    def quota_window_start(quota: QuotaConfig, now_ts: float | None = None) -> float:
+        now = datetime.fromtimestamp(now_ts or time.time(), tz=timezone.utc)
+        start = now.replace(
+            hour=max(0, min(23, quota.quota_reset_hour)), minute=0, second=0, microsecond=0
+        )
+        if now < start:
+            start -= timedelta(days=1)
+        return start.timestamp()
+
+    def _latency_samples(self, provider: str, metric_date: date) -> tuple[float, ...]:
+        start = datetime.combine(metric_date, datetime.min.time(), tzinfo=timezone.utc).timestamp()
+        end = start + 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT latency_ms FROM provider_request_events
+            WHERE provider_name = ? AND occurred_at >= ? AND occurred_at < ? AND latency_ms >= 0
+            ORDER BY latency_ms
+            """,
+            (provider, start, end),
+        ).fetchall()
+        return tuple(float(row["latency_ms"]) for row in rows)
+
+    def _record_request_conn(
+        self,
+        conn: sqlite3.Connection,
+        provider: str,
+        success: bool,
+        prompt_tokens: int,
+        completion_tokens: int,
+        latency_ms: float,
+        status_code: int | None,
+        request_kind: str,
+        occurred_at: float,
+    ) -> None:
+        metric_date = datetime.fromtimestamp(occurred_at, tz=timezone.utc).date().isoformat()
+        total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
+        conn.execute(
+            """
+            INSERT INTO provider_request_events
+            (provider_name, occurred_at, success, prompt_tokens, completion_tokens,
+             total_tokens, latency_ms, status_code, request_kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                provider,
+                occurred_at,
+                1 if success else 0,
+                max(0, prompt_tokens),
+                max(0, completion_tokens),
+                total_tokens,
+                max(0.0, latency_ms),
+                status_code,
+                request_kind,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO provider_daily_metrics
+            (provider_name, metric_date, api_calls_total, api_calls_failed,
+             prompt_tokens, completion_tokens, total_tokens, latency_sum_ms, latency_count)
+            VALUES (?, ?, 1, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(provider_name, metric_date) DO UPDATE SET
+                api_calls_total = api_calls_total + 1,
+                api_calls_failed = api_calls_failed + excluded.api_calls_failed,
+                prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                completion_tokens = completion_tokens + excluded.completion_tokens,
+                total_tokens = total_tokens + excluded.total_tokens,
+                latency_sum_ms = latency_sum_ms + excluded.latency_sum_ms,
+                latency_count = latency_count + 1,
+                last_updated = CURRENT_TIMESTAMP
+            """,
+            (
+                provider,
+                metric_date,
+                0 if success else 1,
+                max(0, prompt_tokens),
+                max(0, completion_tokens),
+                total_tokens,
+                max(0.0, latency_ms),
+            ),
+        )
 
     def record_request(
         self,
@@ -130,86 +267,83 @@ class MetricsDB:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         latency_ms: float = 0.0,
-    ):
-        today = date.today().isoformat()
+        status_code: int | None = None,
+        request_kind: str = "inference",
+    ) -> None:
         with self.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO provider_daily_metrics
-                (provider_name, metric_date, api_calls_total, api_calls_failed,
-                 prompt_tokens, completion_tokens, total_tokens, latency_sum_ms, latency_count)
-                VALUES (?, ?, 1, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(provider_name, metric_date) DO UPDATE SET
-                    api_calls_total = api_calls_total + 1,
-                    api_calls_failed = api_calls_failed + ?,
-                    prompt_tokens = prompt_tokens + ?,
-                    completion_tokens = completion_tokens + ?,
-                    total_tokens = total_tokens + ?,
-                    latency_sum_ms = latency_sum_ms + ?,
-                    latency_count = latency_count + 1,
-                    last_updated = CURRENT_TIMESTAMP
-                """,
-                (
-                    provider,
-                    today,
-                    0 if success else 1,
-                    prompt_tokens,
-                    completion_tokens,
-                    prompt_tokens + completion_tokens,
-                    latency_ms,
-                    0 if success else 1,
-                    prompt_tokens,
-                    completion_tokens,
-                    prompt_tokens + completion_tokens,
-                    latency_ms,
-                ),
+            self._record_request_conn(
+                conn,
+                provider,
+                success,
+                prompt_tokens,
+                completion_tokens,
+                latency_ms,
+                status_code,
+                request_kind,
+                time.time(),
             )
 
-    def upsert_rate_limit(
-        self,
-        provider: str,
-        limit_type: str,
-        limit_value: int | None,
-        remaining: int | None,
-        reset_timestamp: int | None,
-        header_source: str | None,
-    ):
+    def upsert_rate_limits(self, provider: str, limits: Iterable[object]) -> None:
         with self.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO provider_rate_limits
-                (provider_name, limit_type, limit_value, remaining, reset_timestamp, header_source, last_polled)
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(provider_name) DO UPDATE SET
-                    limit_type = ?,
-                    limit_value = ?,
-                    remaining = ?,
-                    reset_timestamp = ?,
-                    header_source = ?,
-                    last_polled = CURRENT_TIMESTAMP
-                """,
-                (
-                    provider,
-                    limit_type,
-                    limit_value,
-                    remaining,
-                    reset_timestamp,
-                    header_source,
-                    limit_type,
-                    limit_value,
-                    remaining,
-                    reset_timestamp,
-                    header_source,
-                ),
-            )
+            for item in limits:
+                conn.execute(
+                    """
+                    INSERT INTO provider_rate_limit_windows
+                    (provider_name, limit_type, limit_value, remaining, reset_timestamp,
+                     header_source, last_polled)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(provider_name, limit_type) DO UPDATE SET
+                        limit_value = excluded.limit_value,
+                        remaining = excluded.remaining,
+                        reset_timestamp = excluded.reset_timestamp,
+                        header_source = excluded.header_source,
+                        last_polled = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        provider,
+                        getattr(item, "limit_type"),
+                        getattr(item, "limit_value"),
+                        getattr(item, "remaining"),
+                        getattr(item, "reset_timestamp"),
+                        getattr(item, "header_source"),
+                    ),
+                )
 
-    def get_rate_limit(self, provider: str) -> RateLimitInfo | None:
+    def get_rate_limits(self, provider: str) -> list[RateLimitInfo]:
+        rows = self._get_conn().execute(
+            "SELECT * FROM provider_rate_limit_windows WHERE provider_name = ?",
+            (provider,),
+        ).fetchall()
+        return [self._rate_limit_from_row(row) for row in rows]
+
+    def get_rate_limit(self, provider: str, limit_type: str | None = None) -> RateLimitInfo | None:
         conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM provider_rate_limits WHERE provider_name = ?", (provider,)
-        ).fetchone()
-        if not row:
-            return None
+        if limit_type:
+            row = conn.execute(
+                """SELECT * FROM provider_rate_limit_windows
+                WHERE provider_name = ? AND limit_type = ?""",
+                (provider, limit_type),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT * FROM provider_rate_limit_windows
+                WHERE provider_name = ?
+                ORDER BY CASE WHEN remaining IS NULL THEN 1 ELSE 0 END, remaining ASC
+                LIMIT 1
+                """,
+                (provider,),
+            ).fetchone()
+        return self._rate_limit_from_row(row) if row else None
+
+    def get_all_rate_limits(self) -> list[RateLimitInfo]:
+        rows = self._get_conn().execute(
+            "SELECT * FROM provider_rate_limit_windows ORDER BY provider_name, limit_type"
+        ).fetchall()
+        return [self._rate_limit_from_row(row) for row in rows]
+
+    @staticmethod
+    def _rate_limit_from_row(row: sqlite3.Row) -> RateLimitInfo:
         return RateLimitInfo(
             provider_name=row["provider_name"],
             limit_type=row["limit_type"],
@@ -220,32 +354,17 @@ class MetricsDB:
             last_polled=datetime.fromisoformat(row["last_polled"]),
         )
 
-    def get_all_rate_limits(self) -> list[RateLimitInfo]:
-        conn = self._get_conn()
-        rows = conn.execute("SELECT * FROM provider_rate_limits").fetchall()
-        return [
-            RateLimitInfo(
-                provider_name=r["provider_name"],
-                limit_type=r["limit_type"],
-                limit_value=r["limit_value"],
-                remaining=r["remaining"],
-                reset_timestamp=r["reset_timestamp"],
-                header_source=r["header_source"],
-                last_polled=datetime.fromisoformat(r["last_polled"]),
-            )
-            for r in rows
-        ]
-
-    def upsert_quota(self, quota: QuotaConfig):
+    def upsert_quota(self, quota: QuotaConfig) -> None:
         with self.transaction() as conn:
             conn.execute(
                 """
-                INSERT INTO provider_quotas (provider_name, daily_request_limit, daily_token_limit, quota_reset_hour)
+                INSERT INTO provider_quotas
+                (provider_name, daily_request_limit, daily_token_limit, quota_reset_hour)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(provider_name) DO UPDATE SET
-                    daily_request_limit = ?,
-                    daily_token_limit = ?,
-                    quota_reset_hour = ?,
+                    daily_request_limit = excluded.daily_request_limit,
+                    daily_token_limit = excluded.daily_token_limit,
+                    quota_reset_hour = excluded.quota_reset_hour,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -253,15 +372,11 @@ class MetricsDB:
                     quota.daily_request_limit,
                     quota.daily_token_limit,
                     quota.quota_reset_hour,
-                    quota.daily_request_limit,
-                    quota.daily_token_limit,
-                    quota.quota_reset_hour,
                 ),
             )
 
     def get_quota(self, provider: str) -> QuotaConfig | None:
-        conn = self._get_conn()
-        row = conn.execute(
+        row = self._get_conn().execute(
             "SELECT * FROM provider_quotas WHERE provider_name = ?", (provider,)
         ).fetchone()
         if not row:
@@ -274,22 +389,161 @@ class MetricsDB:
         )
 
     def get_all_quotas(self) -> list[QuotaConfig]:
-        conn = self._get_conn()
-        rows = conn.execute("SELECT * FROM provider_quotas").fetchall()
+        rows = self._get_conn().execute("SELECT * FROM provider_quotas").fetchall()
         return [
             QuotaConfig(
-                provider_name=r["provider_name"],
-                daily_request_limit=r["daily_request_limit"],
-                daily_token_limit=r["daily_token_limit"],
-                quota_reset_hour=r["quota_reset_hour"],
+                provider_name=row["provider_name"],
+                daily_request_limit=row["daily_request_limit"],
+                daily_token_limit=row["daily_token_limit"],
+                quota_reset_hour=row["quota_reset_hour"],
             )
-            for r in rows
+            for row in rows
         ]
 
+    def _window_usage_conn(
+        self, conn: sqlite3.Connection, provider: str, quota: QuotaConfig, now_ts: float
+    ) -> tuple[int, int, int, int]:
+        window_start = self.quota_window_start(quota, now_ts)
+        event = conn.execute(
+            """
+            SELECT COUNT(*) AS calls, COALESCE(SUM(total_tokens), 0) AS tokens
+            FROM provider_request_events
+            WHERE provider_name = ? AND occurred_at >= ? AND occurred_at <= ?
+            """,
+            (provider, window_start, now_ts),
+        ).fetchone()
+        reservation = conn.execute(
+            """
+            SELECT COALESCE(SUM(reserved_requests), 0) AS calls,
+                   COALESCE(SUM(reserved_tokens), 0) AS tokens
+            FROM provider_quota_reservations
+            WHERE provider_name = ? AND expires_at > ?
+            """,
+            (provider, now_ts),
+        ).fetchone()
+        return (
+            int(event["calls"] or 0),
+            int(event["tokens"] or 0),
+            int(reservation["calls"] or 0),
+            int(reservation["tokens"] or 0),
+        )
+
+    def reserve_quota(
+        self,
+        provider: str,
+        estimated_tokens: int = 0,
+        ttl_seconds: int = 600,
+    ) -> str | None:
+        quota = self.get_quota(provider)
+        if not quota or (quota.daily_request_limit is None and quota.daily_token_limit is None):
+            return None
+        now_ts = time.time()
+        with self.transaction(immediate=True) as conn:
+            conn.execute("DELETE FROM provider_quota_reservations WHERE expires_at <= ?", (now_ts,))
+            calls, tokens, reserved_calls, reserved_tokens = self._window_usage_conn(
+                conn, provider, quota, now_ts
+            )
+            next_calls = calls + reserved_calls + 1
+            next_tokens = tokens + reserved_tokens + max(0, estimated_tokens)
+            if quota.daily_request_limit is not None and next_calls > quota.daily_request_limit:
+                raise QuotaLimitExceeded(
+                    f"Daily request limit ({quota.daily_request_limit}) would be exceeded"
+                )
+            if quota.daily_token_limit is not None and next_tokens > quota.daily_token_limit:
+                raise QuotaLimitExceeded(
+                    f"Daily token limit ({quota.daily_token_limit}) would be exceeded"
+                )
+            reservation_id = uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO provider_quota_reservations
+                (reservation_id, provider_name, created_at, expires_at, reserved_requests, reserved_tokens)
+                VALUES (?, ?, ?, ?, 1, ?)
+                """,
+                (
+                    reservation_id,
+                    provider,
+                    now_ts,
+                    now_ts + max(30, ttl_seconds),
+                    max(0, estimated_tokens),
+                ),
+            )
+            return reservation_id
+
+    def reconcile_reservation(
+        self,
+        reservation_id: str | None,
+        provider: str,
+        success: bool,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: float = 0.0,
+        status_code: int | None = None,
+        request_kind: str = "inference",
+    ) -> None:
+        with self.transaction(immediate=True) as conn:
+            if reservation_id:
+                conn.execute(
+                    "DELETE FROM provider_quota_reservations WHERE reservation_id = ?",
+                    (reservation_id,),
+                )
+            self._record_request_conn(
+                conn,
+                provider,
+                success,
+                prompt_tokens,
+                completion_tokens,
+                latency_ms,
+                status_code,
+                request_kind,
+                time.time(),
+            )
+
+    def cancel_reservation(self, reservation_id: str | None) -> None:
+        if not reservation_id:
+            return
+        with self.transaction(immediate=True) as conn:
+            conn.execute(
+                "DELETE FROM provider_quota_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            )
+
+    def check_quota_exceeded(self, provider: str) -> tuple[bool, str | None]:
+        quota = self.get_quota(provider)
+        if not quota:
+            return False, None
+        calls, tokens, reserved_calls, reserved_tokens = self._window_usage_conn(
+            self._get_conn(), provider, quota, time.time()
+        )
+        if quota.daily_request_limit is not None and calls + reserved_calls >= quota.daily_request_limit:
+            return True, f"Daily request limit ({quota.daily_request_limit}) exceeded"
+        if quota.daily_token_limit is not None and tokens + reserved_tokens >= quota.daily_token_limit:
+            return True, f"Daily token limit ({quota.daily_token_limit}) exceeded"
+        return False, None
+
+    def get_remaining_quota(self, provider: str) -> dict[str, int | None]:
+        quota = self.get_quota(provider)
+        if not quota:
+            return {"requests_remaining": None, "tokens_remaining": None}
+        calls, tokens, reserved_calls, reserved_tokens = self._window_usage_conn(
+            self._get_conn(), provider, quota, time.time()
+        )
+        return {
+            "requests_remaining": (
+                max(0, quota.daily_request_limit - calls - reserved_calls)
+                if quota.daily_request_limit is not None
+                else None
+            ),
+            "tokens_remaining": (
+                max(0, quota.daily_token_limit - tokens - reserved_tokens)
+                if quota.daily_token_limit is not None
+                else None
+            ),
+        }
+
     def get_daily_metrics(self, provider: str, days: int = 7) -> list[DailyMetrics]:
-        cutoff = (date.today() - timedelta(days=days)).isoformat()
-        conn = self._get_conn()
-        rows = conn.execute(
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=max(0, days - 1))).isoformat()
+        rows = self._get_conn().execute(
             """
             SELECT * FROM provider_daily_metrics
             WHERE provider_name = ? AND metric_date >= ?
@@ -297,33 +551,36 @@ class MetricsDB:
             """,
             (provider, cutoff),
         ).fetchall()
-        return [
-            DailyMetrics(
-                provider_name=r["provider_name"],
-                metric_date=date.fromisoformat(r["metric_date"]),
-                api_calls_total=r["api_calls_total"],
-                api_calls_failed=r["api_calls_failed"],
-                prompt_tokens=r["prompt_tokens"],
-                completion_tokens=r["completion_tokens"],
-                total_tokens=r["total_tokens"],
-                latency_sum_ms=r["latency_sum_ms"],
-                latency_count=r["latency_count"],
+        result: list[DailyMetrics] = []
+        for row in rows:
+            metric_date = date.fromisoformat(row["metric_date"])
+            result.append(
+                DailyMetrics(
+                    provider_name=row["provider_name"],
+                    metric_date=metric_date,
+                    api_calls_total=row["api_calls_total"],
+                    api_calls_failed=row["api_calls_failed"],
+                    prompt_tokens=row["prompt_tokens"],
+                    completion_tokens=row["completion_tokens"],
+                    total_tokens=row["total_tokens"],
+                    latency_sum_ms=row["latency_sum_ms"],
+                    latency_count=row["latency_count"],
+                    latency_samples=self._latency_samples(provider, metric_date),
+                )
             )
-            for r in rows
-        ]
+        return result
 
     def get_today_metrics(self, provider: str) -> DailyMetrics | None:
-        today = date.today().isoformat()
-        conn = self._get_conn()
-        row = conn.execute(
+        today = datetime.now(timezone.utc).date()
+        row = self._get_conn().execute(
             "SELECT * FROM provider_daily_metrics WHERE provider_name = ? AND metric_date = ?",
-            (provider, today),
+            (provider, today.isoformat()),
         ).fetchone()
         if not row:
             return None
         return DailyMetrics(
             provider_name=row["provider_name"],
-            metric_date=date.fromisoformat(row["metric_date"]),
+            metric_date=today,
             api_calls_total=row["api_calls_total"],
             api_calls_failed=row["api_calls_failed"],
             prompt_tokens=row["prompt_tokens"],
@@ -331,66 +588,19 @@ class MetricsDB:
             total_tokens=row["total_tokens"],
             latency_sum_ms=row["latency_sum_ms"],
             latency_count=row["latency_count"],
+            latency_samples=self._latency_samples(provider, today),
         )
 
-    def check_quota_exceeded(self, provider: str) -> tuple[bool, str | None]:
-        quota = self.get_quota(provider)
-        if not quota:
-            return False, None
-        today = self.get_today_metrics(provider)
-        if not today:
-            return False, None
-        if quota.daily_request_limit and today.api_calls_total >= quota.daily_request_limit:
-            return True, f"Daily request limit ({quota.daily_request_limit}) exceeded"
-        if quota.daily_token_limit and today.total_tokens >= quota.daily_token_limit:
-            return True, f"Daily token limit ({quota.daily_token_limit}) exceeded"
-        return False, None
+    def cleanup_old_metrics(self, retention_days: int = 30) -> None:
+        cutoff_date = (datetime.now(timezone.utc).date() - timedelta(days=retention_days)).isoformat()
+        cutoff_ts = time.time() - retention_days * 86400
+        now_ts = time.time()
+        with self.transaction(immediate=True) as conn:
+            conn.execute("DELETE FROM provider_daily_metrics WHERE metric_date < ?", (cutoff_date,))
+            conn.execute("DELETE FROM provider_request_events WHERE occurred_at < ?", (cutoff_ts,))
+            conn.execute("DELETE FROM provider_quota_reservations WHERE expires_at <= ?", (now_ts,))
 
-    def get_remaining_quota(self, provider: str) -> dict[str, int | None]:
-        quota = self.get_quota(provider)
-        today = self.get_today_metrics(provider)
-        if not quota:
-            return {"requests_remaining": None, "tokens_remaining": None}
-        if not today:
-            return {
-                "requests_remaining": quota.daily_request_limit,
-                "tokens_remaining": quota.daily_token_limit,
-            }
-        return {
-            "requests_remaining": (
-                quota.daily_request_limit - today.api_calls_total
-                if quota.daily_request_limit
-                else None
-            ),
-            "tokens_remaining": (
-                quota.daily_token_limit - today.total_tokens
-                if quota.daily_token_limit
-                else None
-            ),
-        }
-
-    def cleanup_old_metrics(self, retention_days: int = 30):
-        cutoff = (date.today() - timedelta(days=retention_days)).isoformat()
-        with self.transaction() as conn:
-            conn.execute(
-                "DELETE FROM provider_daily_metrics WHERE metric_date < ?", (cutoff,)
-            )
-
-    def close(self):
+    def close(self) -> None:
         if hasattr(self._local, "conn"):
             self._local.conn.close()
             delattr(self._local, "conn")
-
-
-_global_db: MetricsDB | None = None
-
-
-def get_metrics_db(config_path: Path | None = None, db_path: Path | None = None) -> MetricsDB:
-    global _global_db
-    if _global_db is None:
-        if config_path is None:
-            config_path = Path(__file__).resolve().parent.parent.parent / "config.toml"
-        if db_path is None:
-            db_path = config_path.parent / "metrics.db"
-        _global_db = MetricsDB(db_path)
-    return _global_db
