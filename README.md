@@ -1,30 +1,36 @@
 # llm-router
 
-OpenAI-compatible LLM router that bridges **multiple cloud providers** (HuggingFace, NVIDIA NIM, Cerebras, Groq, Google AI) with **local self-hosted models** (llama.cpp) as an automatic fallback.
+OpenAI-compatible LLM router that bridges multiple cloud inference providers with local self-hosted models, with quota-aware **zero-cost-first routing** and automatic fallback.
 
-The default configuration now supports **zero-cost-first routing**: a packaged 52-entry provider/program matrix assigns each free route a reproducible score, filters finite trials and eligibility-gated offers by policy, blends the static score with live quota/health telemetry, and moves to the next renewable route when a provider is rate-limited or exhausted.
+The router packages a 52-entry provider/program matrix, scores renewable free resources, observes real provider rate-limit headers, and avoids consuming finite trial credit unless policy explicitly allows it.
 
-## Architecture
+## Key behavior
 
-- **HuggingFace**: `https://router.huggingface.co/v1` — Serverless Inference API.
-- **Groq**: `https://api.groq.com/openai/v1` — OpenAI-compatible, recurring free quotas.
-- **NVIDIA NIM**: `https://integrate.api.nvidia.com/v1` — OpenAI-compatible trial route.
-- **Cerebras**: `https://api.cerebras.ai/v1` — OpenAI-compatible trial route.
-- **Google AI**: `https://generativelanguage.googleapis.com/v1beta` — Gemini API.
-- **Local**: any OpenAI-compatible local server, default `http://127.0.0.1:8081`.
+- **Zero-cost-first routing**: recurring free routes are preferred before local compute and finite trials.
+- **Passive-first health**: normal daemon operation does **not** poll cloud `/models` endpoints every minute. Real inference traffic updates health, latency, quota, and rate-limit state.
+- **Cached model discovery**: `/v1/models` caches provider model lists for six hours by default and exponentially backs off failed refreshes. `?refresh=true` forces an explicit refresh.
+- **Non-blocking metrics**: SQLite work is serialized on a dedicated worker thread so request handlers do not block the asyncio event loop.
+- **Concurrency-safe quota guards**: optional local caps reserve request/token budget before dispatch and reconcile actual usage afterward.
+- **Multi-window rate limits**: request and token limits are retained independently instead of overwriting one another.
+- **Real latency percentiles**: p50/p99 are calculated from request samples rather than estimated from averages.
+- **Gemini normalization**: system instructions, assistant/model roles, tool calls, and streaming responses are translated to/from the OpenAI chat-completions shape.
+- **Tools and structured requests**: the public request schema supports tool definitions, tool choice, multimodal content parts, `response_format`, and related OpenAI-compatible fields.
+- **Optional router authentication**: set `ROUTER_API_KEY` to protect all `/v1/*` endpoints when exposing the service beyond loopback.
 
-### Routing strategies
+## Providers
 
-- **`zero-cost`** — default. Prefer active, recurring, directly routable free providers by matrix score. Exhausted/rate-limited routes are skipped and the next eligible free route is attempted. Finite trials are preserved unless explicitly enabled.
-- **`cloud-first`** — original behavior: use the resolved cloud route and fail over on retryable provider failures.
-- **`local-first`** — prefer local llama.cpp before cloud routes.
-- **Explicit routing** — `"model": "nvidia:meta/llama-3.3-70b-instruct"` or `"provider": "groq"` still forces that provider and bypasses zero-cost reordering.
+The default config includes Hugging Face, Groq, NVIDIA NIM, Cerebras, Google AI/Gemini, and a local OpenAI-compatible llama.cpp server. The provider matrix contains additional free/trial/conditional programs for future adapters and routing decisions.
 
-The static score is a **routing prior, not a model benchmark**. It rewards recurring allowances, direct/API access, OpenAI compatibility, tool calling, CLI/API usability, coding quality, explicit token quotas, no-card access, and favorable privacy characteristics. See [docs/ROUTING_SCORE.md](docs/ROUTING_SCORE.md) and [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md).
+## Routing strategies
 
-### Zero-cost policy
+- `zero-cost` — default; route among eligible renewable free resources using the provider matrix plus live telemetry.
+- `cloud-first` — preserve the original primary-cloud/fallback behavior.
+- `local-first` — prefer local llama.cpp first.
+- Explicit `provider` or `provider:model` routing bypasses automatic reordering.
 
-The defaults intentionally conserve finite credits:
+The static score is a routing prior, not a model benchmark. See [docs/ROUTING_SCORE.md](docs/ROUTING_SCORE.md), [docs/PROVIDER_MATRIX.md](docs/PROVIDER_MATRIX.md), and [docs/AUDIT_REMEDIATION.md](docs/AUDIT_REMEDIATION.md).
+
+## Zero-cost policy
 
 ```bash
 LLM_ROUTER_MIN_ZERO_COST_SCORE=60
@@ -38,19 +44,20 @@ LLM_ROUTER_LOCAL_SCORE=76
 LLM_ROUTER_PRIMARY_BONUS=2.0
 ```
 
-With the current matrix, configured recurring providers such as Groq and Hugging Face are eligible by default. Google AI unpaid-service metadata is retained but its documented data-improvement terms trigger the default privacy gate; Cerebras and NVIDIA hosted trial routes are retained but are not consumed until trials are enabled.
+Provider-wide quotas are deliberately **not guessed in the default config** because free limits are often model-, tier-, and account-specific. Provider response headers are observed automatically. Optional local safety caps can be configured in `config.toml` when the exact account/model limits are known.
 
-### Endpoints
+## Endpoints
 
 | Endpoint | Description |
 |---|---|
-| `GET /healthz` | Health check + provider list |
-| `GET /v1/models` | List all available models across providers |
-| `GET /v1/providers` | Poll provider availability + latency + model counts |
-| `GET /v1/provider-matrix` | Configured provider metadata, eligibility reasons, static score and live dynamic score |
-| `GET /v1/metrics` | Router metrics for all providers |
-| `GET /v1/metrics/{provider}` | Metrics for one provider |
-| `POST /v1/chat/completions` | OpenAI-compatible chat completion (streaming + non-streaming) |
+| `GET /healthz` | Local router health; no cloud calls |
+| `GET /v1/models` | Cached model discovery; `?refresh=true` forces a refresh |
+| `GET /v1/providers` | Cached provider health/quota/latency state; no cloud calls |
+| `GET /v1/provider-matrix` | Static + dynamic zero-cost scores and eligibility reasons |
+| `GET /v1/metrics` | Metrics for all providers |
+| `GET /v1/metrics/{provider}` | Metrics and all observed rate-limit windows for one provider |
+| `GET /metrics` | Prometheus text metrics |
+| `POST /v1/chat/completions` | OpenAI-compatible streaming/non-streaming inference |
 
 ## Setup
 
@@ -61,76 +68,53 @@ uv sync
 uv run uvicorn llm_router.main:app --host 0.0.0.0 --port 8000
 ```
 
-### `.env` configuration
+For a LAN-accessible deployment, set a strong router key:
 
 ```bash
-HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxx
-GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxx
-NVIDIA_API_KEY=nvapi-xxxxxxxxxxxxxxxx
-CEREBRAS_API_KEY=csk_xxxxxxxxxxxxxxxxxxxxxxxx
-GOOGLE_AI_API_KEY=AIzaSyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-LOCAL_BASE_URL=http://127.0.0.1:8081
-HOST=0.0.0.0
-PORT=8000
+ROUTER_API_KEY='replace-with-a-long-random-secret'
 ```
+
+Clients can then use either `Authorization: Bearer <key>` or `X-API-Key: <key>`.
 
 ## Usage
 
-### Basic zero-cost-routed chat completion
-
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_ROUTER_KEY' \
   -d '{"model":"qwen3-8b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-### Force a specific provider
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"nvidia:meta/llama-3.3-70b-instruct","messages":[{"role":"user","content":"Hello"}]}'
-
-curl http://localhost:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"local:granite-3.3-2b-instruct","messages":[{"role":"user","content":"Hello"}]}'
-```
-
-### Inspect the current free-route ranking
+Inspect the current route order without triggering provider probes:
 
 ```bash
 curl http://localhost:8000/v1/provider-matrix | jq
 ```
 
-Each configured provider includes `static_score`, `dynamic_score`, `eligible`, and any exclusion reasons such as `trial-disabled`, `quota-exhausted`, `rate-limit-exhausted`, or `privacy-policy`.
-
-### Streaming
+Refresh model discovery explicitly:
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3-8b","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+curl 'http://localhost:8000/v1/models?refresh=true' | jq
 ```
 
-### Verify API keys
+## Operational model
 
-```bash
-uv run python tools/verify_keys.py
+```text
+real inference response
+        │
+        ├── provider health/latency
+        ├── request + token rate-limit windows
+        ├── actual token usage
+        └── quota reconciliation
+                 │
+                 ▼
+          cached route state
+             ┌───┴───┐
+             ▼       ▼
+           router  dashboard
 ```
 
-## Model aliases (`config.toml`)
-
-| Alias | Preferred provider | Model ID |
-|---|---|---|
-| `qwen3-8b` | HuggingFace | Qwen/Qwen3-8B |
-| `qwen3-14b` | HuggingFace | Qwen/Qwen3-14B |
-| `qwen2.5-7b` | HuggingFace | Qwen/Qwen2.5-7B-Instruct |
-| `llama-3.1-8b` | HuggingFace | meta-llama/Llama-3.1-8B-Instruct |
-| `deepseek-r1-7b` | HuggingFace | deepseek-ai/DeepSeek-R1-Distill-Qwen-7B |
-| `granite` | Local | granite-3.3-2b-instruct |
-| `local` | Local | granite-3.3-2b-instruct |
-
-Under `zero-cost`, these are preferred model routes rather than hard provider pins. Use `provider` or `provider:model` when exact-provider/model semantics are required.
+No background task calls provider model-list endpoints. The only recurring background work is local metrics retention/report maintenance, executed outside the asyncio event loop.
 
 ## Tests
 
@@ -138,7 +122,7 @@ Under `zero-cost`, these are preferred model routes rather than hard provider pi
 uv run pytest
 ```
 
-The score tests also recompute all 52 packaged matrix scores and fail if the implementation drifts from the published matrix.
+The operational suite covers quota reservations, reset-hour windows, separate request/token limits, true latency percentiles, model-cache behavior, malformed rate-limit headers, and Gemini request/stream translation. GitHub Actions runs tests on Python 3.12 plus critical Ruff checks; Pyright is included as a non-blocking advisory check while older modules are incrementally typed.
 
 ## Project structure
 
@@ -146,17 +130,23 @@ The score tests also recompute all 52 packaged matrix scores and fail if the imp
 llm-router/
 ├── config.toml
 ├── docs/
+│   ├── AUDIT_REMEDIATION.md
 │   ├── PROVIDER_MATRIX.md
 │   └── ROUTING_SCORE.md
 ├── src/llm_router/
-│   ├── data/provider_matrix_*.json
+│   ├── async_metrics.py
+│   ├── metrics_db.py
+│   ├── metrics_report.py
 │   ├── provider_matrix.py
+│   ├── rate_limits.py
+│   ├── router.py
 │   ├── routing_score.py
 │   ├── zero_cost_router.py
-│   ├── router.py
-│   ├── main.py
 │   └── providers/
+│       ├── base.py
+│       └── google_ai.py
 └── tests/
+    ├── test_operational_correctness.py
     ├── test_router.py
     ├── test_routing_score.py
     └── test_zero_cost_router.py
