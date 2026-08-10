@@ -1,6 +1,7 @@
 # src/llm_router/zero_cost_router.py
 from __future__ import annotations
 
+import time
 from typing import AsyncIterator
 
 import httpx
@@ -22,17 +23,15 @@ class ZeroCostModelRouter(ModelRouter):
         http: httpx.AsyncClient,
         policy: ZeroCostPolicy | None = None,
     ) -> None:
-        # Load immutable packaged metadata during startup, never on the request path.
         load_provider_matrix()
         super().__init__(settings, http)
         self.zero_cost_policy = policy or ZeroCostPolicy.from_env()
 
     def score_provider(self, name: str, *, primary: bool = False) -> RouteScore:
-        status = self.status.get(name)
         return runtime_route_score(
             name,
             get_provider_matrix_entry(name),
-            status,
+            self.status.get(name),
             self.zero_cost_policy,
             primary=primary,
         )
@@ -70,7 +69,6 @@ class ZeroCostModelRouter(ModelRouter):
             names.remove("local")
             names.insert(0, "local")
         elif req.local_first is False and "local" in names:
-            # Explicit false keeps cloud routes first but does not remove local fallback.
             names = [name for name in names if name != "local"] + ["local"]
 
         return [
@@ -92,6 +90,7 @@ class ZeroCostModelRouter(ModelRouter):
 
         for name, model in order:
             provider = self.providers[name]
+            t0 = time.perf_counter()
             try:
                 data = await provider.complete(self._payload(req, model))
             except QuotaExceededError as exc:
@@ -102,6 +101,8 @@ class ZeroCostModelRouter(ModelRouter):
                 errors.append(f"{name}: {exc}")
                 self._mark_retryable_failure(name, exc)
                 continue
+            self._mark_provider_success(name, (time.perf_counter() - t0) * 1000)
+            await self._enrich_status_with_metrics(name)
             return self._to_response(data, model, provider_name=name)
 
         raise ProviderUnavailable("all zero-cost providers failed: " + "; ".join(errors))
@@ -119,9 +120,12 @@ class ZeroCostModelRouter(ModelRouter):
 
         for name, model in order:
             provider = self.providers[name]
+            t0 = time.perf_counter()
             try:
                 async for line in provider.stream(self._payload(req, model)):
                     yield self._annotate_sse(line, name)
+                self._mark_provider_success(name, (time.perf_counter() - t0) * 1000)
+                await self._enrich_status_with_metrics(name)
                 return
             except QuotaExceededError as exc:
                 errors.append(f"{name}: {exc}")
@@ -141,23 +145,22 @@ class ZeroCostModelRouter(ModelRouter):
         if status is None:
             return
         status.daily_calls_remaining = 0
-        status.daily_tokens_remaining = 0
+        status.last_error = "local quota guard exhausted"
+        status.last_polled = time.time()
 
     def _mark_retryable_failure(self, name: str, exc: ProviderUnavailable) -> None:
         status = self.status.get(name)
         if status is None:
             return
+        status.last_error = str(exc)[:200]
+        status.last_polled = time.time()
         if exc.status_code == 429:
             status.rate_limit_remaining = 0
-            rate_limit = self._metrics_db.get_rate_limit(name)
-            if rate_limit is not None:
-                status.rate_limit_reset = rate_limit.reset_timestamp
+            status.rate_limit_reset = exc.retry_after_until
         else:
             status.available = False
-            status.last_error = str(exc)[:200]
 
     def provider_matrix_view(self) -> list[dict]:
-        """Return configured providers with static/dynamic routing metadata."""
         scores = {score.provider: score for score in self.route_scores()}
         output: list[dict] = []
         for name in self.providers:
