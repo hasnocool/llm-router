@@ -65,6 +65,15 @@ class Settings:
     routing_providers: list[str] = field(default_factory=list)
     router_api_key: str | None = None
 
+    def __post_init__(self) -> None:
+        collisions = sorted(set(self.providers).intersection(self.models))
+        if collisions:
+            names = ", ".join(collisions)
+            raise ConfigError(
+                "model aliases must not shadow provider ids; "
+                f"rename these aliases: {names}"
+            )
+
     def provider(self, name: str) -> ProviderConfig:
         try:
             return self.providers[name]
@@ -80,6 +89,13 @@ class Settings:
             pname = normalize_provider(provider_hint)
             if pname in self.providers:
                 return pname, (rest or self.provider(pname).default_model)
+
+        # Bare provider IDs are advertised by the lightweight /v1/models list,
+        # so selecting one must route to that provider's configured default.
+        provider_name = normalize_provider(model)
+        if provider_name in self.providers and model not in self.models:
+            return provider_name, self.provider(provider_name).default_model
+
         route = self.models.get(model)
         if route is not None:
             return route.provider, route.model
