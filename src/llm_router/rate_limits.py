@@ -1,6 +1,7 @@
 # src/llm_router/rate_limits.py
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -138,14 +139,12 @@ def extract_usage_from_streaming_chunk(line: str) -> tuple[int, int] | None:
     if not payload or payload == "[DONE]":
         return None
     try:
-        import json
-
         obj = json.loads(payload)
-        usage = obj.get("usage")
-        if usage:
-            return int(usage.get("prompt_tokens", 0) or 0), int(
-                usage.get("completion_tokens", 0) or 0
-            )
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
+    usage = obj.get("usage")
+    if usage:
+        return int(usage.get("prompt_tokens", 0) or 0), int(
+            usage.get("completion_tokens", 0) or 0
+        )
     return None
