@@ -82,7 +82,34 @@ class ProviderInfo(BaseModel):
     latency_ms: float
     last_error: str
     last_polled: float
+    # Metrics fields
+    daily_calls_used: int = 0
+    daily_calls_remaining: int | None = None
+    daily_tokens_used: int = 0
+    daily_tokens_remaining: int | None = None
+    rate_limit_remaining: int | None = None
+    rate_limit_reset: int | None = None
+    latency_p50_ms: float = 0.0
+    latency_p99_ms: float = 0.0
 
 
 class ProviderList(BaseModel):
     providers: list[ProviderInfo]
+
+
+class MetricsResponse(BaseModel):
+    provider: str
+    daily_calls_used: int
+    daily_calls_remaining: int | None
+    daily_tokens_used: int
+    daily_tokens_remaining: int | None
+    rate_limit_remaining: int | None
+    rate_limit_reset: int | None
+    rate_limit_type: str | None = None
+    latency_p50_ms: float
+    latency_p99_ms: float
+    history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AllMetricsResponse(BaseModel):
+    providers: dict[str, MetricsResponse]

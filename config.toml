@@ -65,3 +65,46 @@ stream_timeout_seconds = 240.0
 "deepseek-r1-7b" = { provider = "huggingface", model = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" }
 "granite" = { provider = "local", model = "granite-3.3-2b-instruct" }
 "local" = { provider = "local", model = "granite-3.3-2b-instruct" }
+
+# Metrics configuration
+[metrics]
+# SQLite database path (relative to config.toml or absolute)
+# db_path = "metrics.db"
+# Background flush interval in seconds
+flush_interval_seconds = 30
+# Retention period for daily metrics in days
+retention_days = 30
+# Markdown report generation interval in seconds
+report_interval_seconds = 30
+
+# Daily quotas per provider (enforced - requests rejected when exceeded)
+[quotas.huggingface]
+daily_requests = 10000
+daily_tokens = 1000000
+reset_hour = 0
+
+[quotas.cerebras]
+daily_requests = 5000
+daily_tokens = 500000
+reset_hour = 0
+
+[quotas.groq]
+daily_requests = 10000
+daily_tokens = 1000000
+reset_hour = 0
+
+[quotas.nvidia]
+daily_requests = 5000
+daily_tokens = 500000
+reset_hour = 0
+
+[quotas.google_ai]
+daily_requests = 1000
+daily_tokens = 100000
+reset_hour = 0
+
+# Local provider typically has no quotas, but can be configured
+# [quotas.local]
+# daily_requests = 100000
+# daily_tokens = 10000000
+# reset_hour = 0

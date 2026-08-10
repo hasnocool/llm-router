@@ -31,11 +31,28 @@ class ModelRoute:
 
 
 @dataclass
+class QuotaConfig:
+    daily_request_limit: int | None = None
+    daily_token_limit: int | None = None
+    quota_reset_hour: int = 0
+
+
+@dataclass
+class MetricsConfig:
+    db_path: str | None = None
+    flush_interval_seconds: int = 30
+    retention_days: int = 30
+    report_interval_seconds: int = 300
+
+
+@dataclass
 class Settings:
     strategy: str = "cloud-first"
     timeout_seconds: float = 60.0
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     models: dict[str, ModelRoute] = field(default_factory=dict)
+    quotas: dict[str, QuotaConfig] = field(default_factory=dict)
+    metrics: MetricsConfig = field(default_factory=MetricsConfig)
     host: str = "0.0.0.0"
     port: int = 8000
 
@@ -44,6 +61,9 @@ class Settings:
             return self.providers[name]
         except KeyError:
             raise ConfigError(f"unknown provider: {name!r}")
+
+    def quota(self, name: str) -> QuotaConfig | None:
+        return self.quotas.get(name)
 
     def resolve(self, model: str) -> tuple[str, str]:
         """Resolve a client-supplied model string to (provider_name, model_id)."""
@@ -104,11 +124,29 @@ def load_settings(
         for alias, route in raw.get("models", {}).items()
     }
 
+    quotas = {}
+    for name, qc in raw.get("quotas", {}).items():
+        quotas[name] = QuotaConfig(
+            daily_request_limit=qc.get("daily_requests"),
+            daily_token_limit=qc.get("daily_tokens"),
+            quota_reset_hour=qc.get("reset_hour", 0),
+        )
+
+    metrics_raw = raw.get("metrics", {})
+    metrics = MetricsConfig(
+        db_path=metrics_raw.get("db_path"),
+        flush_interval_seconds=metrics_raw.get("flush_interval_seconds", 30),
+        retention_days=metrics_raw.get("retention_days", 30),
+        report_interval_seconds=metrics_raw.get("report_interval_seconds", 300),
+    )
+
     return Settings(
         strategy=raw.get("strategy", "cloud-first"),
         timeout_seconds=raw.get("timeout_seconds", 60.0),
         providers=providers,
         models=models,
+        quotas=quotas,
+        metrics=metrics,
         host=env.get("HOST", "0.0.0.0"),
         port=int(env.get("PORT", "8000")),
     )

@@ -8,23 +8,31 @@ from typing import Any, AsyncIterator
 import httpx
 
 from ..config import ProviderConfig
-from .base import ProviderRequestError, ProviderUnavailable
+from ..metrics_db import get_metrics_db
+from ..rate_limits import RateLimitParser, extract_usage_from_response
+from .base import (
+    Provider,
+    ProviderRequestError,
+    ProviderUnavailable,
+    QuotaExceededError,
+    RETRYABLE_STATUSES,
+    get_forwarded_request_headers,
+)
 
-RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 
-
-class GoogleAIProvider:
+class GoogleAIProvider(Provider):
     """Google AI (Gemini) provider using the generativelanguage REST API."""
 
-    def __init__(self, name: str, config: ProviderConfig, http: httpx.AsyncClient):
-        self.name = name
-        self.config = config
-        self._http = http
+    def __init__(
+        self, name: str, config: ProviderConfig, http: httpx.AsyncClient, metrics_db=None
+    ):
+        super().__init__(name, config, http, metrics_db)
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
             headers["x-goog-api-key"] = self.config.api_key
+        headers.update(get_forwarded_request_headers())
         return headers
 
     def _url(self, path: str) -> str:
@@ -60,9 +68,15 @@ class GoogleAIProvider:
                     }
                 ],
                 "usage": {
-                    "prompt_tokens": data.get("usageMetadata", {}).get("promptTokenCount", 0),
-                    "completion_tokens": data.get("usageMetadata", {}).get("candidatesTokenCount", 0),
-                    "total_tokens": data.get("usageMetadata", {}).get("totalTokenCount", 0),
+                    "prompt_tokens": data.get("usageMetadata", {}).get(
+                        "promptTokenCount", 0
+                    ),
+                    "completion_tokens": data.get("usageMetadata", {}).get(
+                        "candidatesTokenCount", 0
+                    ),
+                    "total_tokens": data.get("usageMetadata", {}).get(
+                        "totalTokenCount", 0
+                    ),
                 },
             }
         parts = candidates[0].get("content", {}).get("parts", [])
@@ -80,9 +94,15 @@ class GoogleAIProvider:
                 }
             ],
             "usage": {
-                "prompt_tokens": data.get("usageMetadata", {}).get("promptTokenCount", 0),
-                "completion_tokens": data.get("usageMetadata", {}).get("candidatesTokenCount", 0),
-                "total_tokens": data.get("usageMetadata", {}).get("totalTokenCount", 0),
+                "prompt_tokens": data.get("usageMetadata", {}).get(
+                    "promptTokenCount", 0
+                ),
+                "completion_tokens": data.get("usageMetadata", {}).get(
+                    "candidatesTokenCount", 0
+                ),
+                "total_tokens": data.get("usageMetadata", {}).get(
+                    "totalTokenCount", 0
+                ),
             },
         }
 
@@ -107,12 +127,29 @@ class GoogleAIProvider:
             gemini["generationConfig"] = gen_config
         return gemini
 
+    def _normalize_model(self, model: str) -> str:
+        """Ensure model name has the models/ prefix for Gemini API."""
+        if not model.startswith("models/"):
+            return f"models/{model}"
+        return model
+
+    def _extract_gemini_usage(self, data: dict) -> tuple[int, int]:
+        """Extract token usage from Gemini response."""
+        return (
+            data.get("usageMetadata", {}).get("promptTokenCount", 0),
+            data.get("usageMetadata", {}).get("candidatesTokenCount", 0),
+        )
+
     async def models(self) -> list[dict[str, Any]]:
+        t0 = time.time()
         resp = await self._http.get(
             self._url("models"),
             headers=self._headers(),
         )
+        latency_ms = (time.time() - t0) * 1000
+        self._record_rate_limits(dict(resp.headers))
         self._check(resp)
+        self._record_request_metrics(success=True, latency_ms=latency_ms)
         data = resp.json()
         return [
             {"id": m["name"].removeprefix("models/"), "type": m.get("displayName", "")}
@@ -120,16 +157,12 @@ class GoogleAIProvider:
             if "generateContent" in m.get("supportedGenerationMethods", [])
         ]
 
-    def _normalize_model(self, model: str) -> str:
-        """Ensure model name has the models/ prefix for Gemini API."""
-        if not model.startswith("models/"):
-            return f"models/{model}"
-        return model
-
     async def complete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._check_quota()
         model = payload.get("model", self.config.default_model)
         gemini_payload = self._openai_to_gemini_payload(payload)
         api_model = self._normalize_model(model)
+        t0 = time.time()
         try:
             resp = await self._http.post(
                 self._url(f"{api_model}:generateContent"),
@@ -138,17 +171,36 @@ class GoogleAIProvider:
                 timeout=self.config.timeout_seconds,
             )
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+            self._record_request_metrics(success=False, latency_ms=(time.time() - t0) * 1000)
             raise ProviderUnavailable(f"{self.name} unreachable: {exc}") from exc
+
+        latency_ms = (time.time() - t0) * 1000
+        self._record_rate_limits(dict(resp.headers))
         self._check(resp)
-        return self._gemini_to_openai(resp.json(), model)
+
+        data = resp.json()
+        prompt_tokens, completion_tokens = self._extract_gemini_usage(data)
+        self._record_request_metrics(
+            success=True,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            latency_ms=latency_ms,
+        )
+        return self._gemini_to_openai(data, model)
 
     async def stream(self, payload: dict[str, Any]) -> AsyncIterator[str]:
         """Streaming via Gemini (not natively SSE-compatible; we buffer the result)."""
+        self._check_quota()
         model = payload.get("model", self.config.default_model)
         gemini_payload = self._openai_to_gemini_payload(payload)
         gemini_payload["generationConfig"] = gemini_payload.get("generationConfig", {})
         gemini_payload["generationConfig"]["responseModalities"] = ["TEXT"]
         api_model = self._normalize_model(model)
+        t0 = time.time()
+        emitted = False
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+
         try:
             headers = self._headers()
             headers["Accept"] = "text/event-stream"
@@ -159,7 +211,25 @@ class GoogleAIProvider:
                 timeout=self.config.stream_timeout_seconds,
             )
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+            self._record_request_metrics(
+                success=False,
+                prompt_tokens=total_prompt_tokens,
+                completion_tokens=total_completion_tokens,
+                latency_ms=(time.time() - t0) * 1000,
+            )
             raise ProviderUnavailable(f"{self.name} unreachable during stream: {exc}") from exc
+
+        self._record_rate_limits(dict(resp.headers))
         self._check(resp)
+
         async for line in resp.aiter_lines():
+            if not emitted and line:
+                emitted = True
             yield line
+
+        self._record_request_metrics(
+            success=True,
+            prompt_tokens=total_prompt_tokens,
+            completion_tokens=total_completion_tokens,
+            latency_ms=(time.time() - t0) * 1000,
+        )

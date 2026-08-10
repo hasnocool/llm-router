@@ -4,7 +4,12 @@ import httpx
 import pytest
 
 from llm_router.config import ModelRoute, ProviderConfig, Settings, load_settings
-from llm_router.providers.base import ProviderRequestError, ProviderUnavailable
+from llm_router.providers.base import (
+    ProviderRequestError,
+    ProviderUnavailable,
+    reset_forwarded_request_headers,
+    set_forwarded_request_headers,
+)
 from llm_router.router import ModelRouter
 from llm_router.schemas import ChatRequest, Message
 
@@ -141,6 +146,28 @@ class TestFailover:
         r = make_router(make_settings(), httpx.MockTransport(handler))
         lines = [ln async for ln in r.stream(req())]
         assert any('"provider": "local"' in ln for ln in lines)
+
+
+class TestHeaders:
+    async def test_forwards_session_affinity_headers(self):
+        seen = {}
+
+        async def handler(request):
+            seen.update({k.lower(): v for k, v in request.headers.items()})
+            return json_response(ok_body("m1"))
+
+        r = make_router(make_settings(), httpx.MockTransport(handler))
+        token = set_forwarded_request_headers(
+            {"X-Session-Id": "sess-123", "prompt_cache_key": "cache-456"}
+        )
+        try:
+            await r.complete(req())
+        finally:
+            reset_forwarded_request_headers(token)
+
+        assert seen["x-session-id"] == "sess-123"
+        assert seen["prompt_cache_key"] == "cache-456"
+        assert "authorization" not in seen
 
 
 class TestAvailability:
