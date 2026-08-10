@@ -1,13 +1,7 @@
+# config.toml
 # llm-router configuration
 
-# Global routing strategy:
-#   "zero-cost"  -> rank renewable free routes using the packaged provider matrix,
-#                   then fail over on quota/rate-limit/provider exhaustion.
-#   "cloud-first" -> preserve the original cloud-first fallback behavior.
-#   "local-first" -> prefer the local llama.cpp provider before cloud routes.
 strategy = "zero-cost"
-
-# Seconds to wait before treating a non-streaming call as failed (per provider).
 timeout_seconds = 60.0
 
 [providers.huggingface]
@@ -55,9 +49,6 @@ api_key_env = "GOOGLE_AI_API_KEY"
 timeout_seconds = 120.0
 stream_timeout_seconds = 240.0
 
-# Model aliases clients can use. A "provider:" prefix forces explicit routing.
-# Under strategy="zero-cost", an unforced request can use another configured
-# provider's default model when that route has a better renewable-free score.
 [models]
 "qwen3-8b" = { provider = "huggingface", model = "Qwen/Qwen3-8B" }
 "qwen3-14b" = { provider = "huggingface", model = "Qwen/Qwen3-14B" }
@@ -67,50 +58,20 @@ stream_timeout_seconds = 240.0
 "granite" = { provider = "local", model = "granite-3.3-2b-instruct" }
 "local" = { provider = "local", model = "granite-3.3-2b-instruct" }
 
-# Zero-cost policy is controlled with environment variables so deployments can
-# change policy without editing this file. See .env.example and docs/ROUTING_SCORE.md.
-
 [metrics]
-# SQLite database path (relative to config.toml or absolute)
 # db_path = "metrics.db"
-flush_interval_seconds = 30
 retention_days = 30
-report_interval_seconds = 30
+report_interval_seconds = 300
+# /models is never used as a background heartbeat. Explicit discovery is cached.
+model_cache_ttl_seconds = 21600
+model_failure_backoff_seconds = 300
+model_failure_backoff_max_seconds = 3600
 
-# Local quota guards. Provider-side rate-limit headers are also observed at
-# runtime. These values are safety caps, not claims that every model receives
-# this exact provider quota.
-[quotas.huggingface]
-daily_requests = 10000
-daily_tokens = 1000000
-reset_hour = 0
-
-# Cerebras is classified as a finite trial in the provider matrix and is
-# excluded by zero-cost policy unless LLM_ROUTER_INCLUDE_TRIALS=true.
-[quotas.cerebras]
-daily_requests = 5000
-daily_tokens = 500000
-reset_hour = 0
-
-# Conservative guard for the configured llama-3.3-70b-versatile free route.
-[quotas.groq]
-daily_requests = 1000
-daily_tokens = 100000
-reset_hour = 0
-
-# NVIDIA hosted NIM trial routes are finite and excluded by default.
-[quotas.nvidia]
-daily_requests = 5000
-daily_tokens = 500000
-reset_hour = 0
-
-[quotas.google_ai]
-daily_requests = 1000
-daily_tokens = 100000
-reset_hour = 0
-
-# Local provider typically has no quota.
-# [quotas.local]
-# daily_requests = 100000
-# daily_tokens = 10000000
-# reset_hour = 0
+# Provider quotas are frequently model/tier/account-specific and change over time.
+# The router learns provider-side request/token windows from response headers.
+# Configure an optional local safety guard only when you know the exact limit:
+#
+# [quotas.groq]
+# daily_requests = 1000
+# daily_tokens = 100000
+# reset_hour = 0  # UTC
