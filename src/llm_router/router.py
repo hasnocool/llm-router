@@ -16,7 +16,7 @@ from .config import Settings, normalize_provider
 from .metrics_db import QuotaConfig
 from .metrics_report import MetricsReportGenerator
 from .providers import build_provider, set_metrics_store
-from .providers.base import ProviderRequestError, ProviderUnavailable, QuotaExceededError
+from .providers.base import Provider, ProviderRequestError, ProviderUnavailable, QuotaExceededError
 from .schemas import ChatMessage, ChatRequest, ChatResponse, ChatUsage, Choice, ModelInfo
 
 
@@ -42,9 +42,9 @@ class ModelRouter:
     def __init__(self, settings: Settings, http: httpx.AsyncClient):
         self.settings = settings
         self._http = http
-        self.providers: dict[str, object] = {}
+        self.providers: dict[str, Provider] = {}
         self.status: dict[str, ProviderStatus] = {}
-        self._bg_tasks: list[asyncio.Task] = []
+        self._bg_tasks: list[asyncio.Task[Any]] = []
         self._started = False
 
         db_path = Path(settings.metrics.db_path) if settings.metrics.db_path else Path("metrics.db")
@@ -137,7 +137,7 @@ class ModelRouter:
             and (item.reset_timestamp is None or item.reset_timestamp > int(time.time()))
         ]
         if active_limits:
-            tightest = min(active_limits, key=lambda item: item.remaining or 0)
+            tightest = min(active_limits, key=lambda item: item.remaining if item.remaining is not None else 0)
             status.rate_limit_remaining = tightest.remaining
             status.rate_limit_reset = tightest.reset_timestamp
         else:
@@ -156,7 +156,7 @@ class ModelRouter:
             return_exceptions=True,
         )
         for name, result in zip(self.providers, results):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 self._mark_provider_failure(name, result)
         await self.refresh_status_from_metrics()
         return self.status
@@ -214,7 +214,7 @@ class ModelRouter:
         status = self.status[name]
         status.last_error = str(exc)[:200]
         status.last_polled = time.time()
-        if not isinstance(exc, ProviderUnavailable) or getattr(exc, "status_code", None) != 429:
+        if not isinstance(exc, ProviderUnavailable) or exc.status_code != 429:
             status.available = False
 
     def ranked_providers(self) -> list[ProviderStatus]:
@@ -284,10 +284,12 @@ class ModelRouter:
             return self._to_response(data, model, provider_name=name)
         raise ProviderUnavailable("all providers failed: " + "; ".join(errors))
 
-    def _to_response(self, data: dict, model: str, provider_name: str) -> ChatResponse:
+    def _to_response(self, data: dict[str, Any], model: str, provider_name: str) -> ChatResponse:
         choice = data["choices"][0]
         msg = choice.get("message") or {"role": "assistant", "content": ""}
         usage = data.get("usage")
+        raw_tool_calls = msg.get("tool_calls")
+        tool_calls = raw_tool_calls if isinstance(raw_tool_calls, list) else None
         return ChatResponse(
             id=data.get("id") or f"chatcmpl-{uuid.uuid4().hex[:12]}",
             created=data.get("created") or int(time.time()),
@@ -298,7 +300,7 @@ class ModelRouter:
                     role=msg.get("role", "assistant"),
                     content=msg.get("content"),
                     reasoning_content=msg.get("reasoning_content"),
-                    tool_calls=msg.get("tool_calls"),
+                    tool_calls=tool_calls,
                 ),
                 finish_reason=choice.get("finish_reason", "stop"),
             )],
@@ -306,7 +308,7 @@ class ModelRouter:
                 prompt_tokens=usage.get("prompt_tokens", 0),
                 completion_tokens=usage.get("completion_tokens", 0),
                 total_tokens=usage.get("total_tokens", 0),
-            ) if usage else None),
+            ) if isinstance(usage, dict) else None),
             provider=provider_name,
         )
 
@@ -357,7 +359,7 @@ class ModelRouter:
         out: list[ModelInfo] = []
         seen_routes: set[tuple[str, str]] = set()
         for name, result in zip(self.providers, results):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 continue
             for item in result:
                 model_id = item.get("id", "")
@@ -381,7 +383,10 @@ class ModelRouter:
             if item.remaining is not None
             and (item.reset_timestamp is None or item.reset_timestamp > int(time.time()))
         ]
-        tightest = min(active, key=lambda item: item.remaining or 0) if active else None
+        tightest = min(
+            active,
+            key=lambda item: item.remaining if item.remaining is not None else 0,
+        ) if active else None
         return {
             "provider": provider,
             "daily_calls_used": today.api_calls_total if today else 0,
