@@ -1,3 +1,4 @@
+# src/llm_router/main.py
 from __future__ import annotations
 
 import json
@@ -24,6 +25,7 @@ from .schemas import (
     ProviderInfo,
     ProviderList,
 )
+from .zero_cost_router import ZeroCostModelRouter
 
 _settings = None
 _router: ModelRouter | None = None
@@ -39,6 +41,7 @@ def get_router() -> ModelRouter:
 async def lifespan(app: FastAPI):
     global _settings, _router
     import logging
+
     logging.basicConfig(level=logging.DEBUG)
     logger = logging.getLogger(__name__)
     try:
@@ -46,7 +49,8 @@ async def lifespan(app: FastAPI):
     except ConfigError as exc:
         raise RuntimeError(f"configuration error: {exc}") from exc
     async with httpx.AsyncClient(timeout=_settings.timeout_seconds) as http:
-        _router = ModelRouter(_settings, http)
+        router_cls = ZeroCostModelRouter if _settings.strategy == "zero-cost" else ModelRouter
+        _router = router_cls(_settings, http)
         _router.start_background_tasks()
         logger.info("Background tasks started, yielding...")
         try:
@@ -138,6 +142,31 @@ async def list_providers():
     )
 
 
+@app.get("/v1/provider-matrix")
+async def provider_matrix():
+    """Expose the configured providers' static matrix and current route scores."""
+    router = get_router()
+    if isinstance(router, ZeroCostModelRouter):
+        return {
+            "strategy": router.settings.strategy,
+            "policy": {
+                "min_score": router.zero_cost_policy.min_score,
+                "include_trials": router.zero_cost_policy.include_trials,
+                "include_conditional": router.zero_cost_policy.include_conditional,
+                "allow_indirect": router.zero_cost_policy.allow_indirect,
+                "allow_self_host": router.zero_cost_policy.allow_self_host,
+                "allow_data_improvement": router.zero_cost_policy.allow_data_improvement,
+                "require_openai_compatible": router.zero_cost_policy.require_openai_compatible,
+            },
+            "providers": router.provider_matrix_view(),
+        }
+    return {
+        "strategy": router.settings.strategy,
+        "providers": [],
+        "message": "Set strategy = 'zero-cost' to enable matrix-aware ranking.",
+    }
+
+
 @app.get("/v1/metrics", response_model=AllMetricsResponse)
 async def get_metrics(days: int = Query(7, ge=1, le=90)):
     router = get_router()
@@ -161,7 +190,6 @@ async def prometheus_metrics():
     router = get_router()
     lines = []
 
-    # Provider info
     for name, provider in router.providers.items():
         status = router.status.get(name)
         if not status:
@@ -192,6 +220,7 @@ async def chat_completions(req: ChatRequest, request: Request):
     token = set_forwarded_request_headers(dict(request.headers))
     router = get_router()
     if req.stream:
+
         async def event_source():
             try:
                 async for line in router.stream(req):
