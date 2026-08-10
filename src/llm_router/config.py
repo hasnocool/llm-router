@@ -66,12 +66,19 @@ class Settings:
     router_api_key: str | None = None
 
     def __post_init__(self) -> None:
-        collisions = sorted(set(self.providers).intersection(self.models))
-        if collisions:
-            names = ", ".join(collisions)
+        # A model alias with the same ID as a provider would otherwise produce
+        # duplicate /v1/models entries. Preserve backwards compatibility for
+        # redundant aliases that simply point to that provider's default model,
+        # but reject ambiguous collisions that would change routing semantics.
+        for name in sorted(set(self.providers).intersection(self.models)):
+            route = self.models[name]
+            provider = self.providers[name]
+            if route.provider == name and route.model == provider.default_model:
+                del self.models[name]
+                continue
             raise ConfigError(
-                "model aliases must not shadow provider ids; "
-                f"rename these aliases: {names}"
+                "model aliases must not ambiguously shadow provider ids; "
+                f"rename alias: {name}"
             )
 
     def provider(self, name: str) -> ProviderConfig:
@@ -93,7 +100,7 @@ class Settings:
         # Bare provider IDs are advertised by the lightweight /v1/models list,
         # so selecting one must route to that provider's configured default.
         provider_name = normalize_provider(model)
-        if provider_name in self.providers and model not in self.models:
+        if provider_name in self.providers:
             return provider_name, self.provider(provider_name).default_model
 
         route = self.models.get(model)
