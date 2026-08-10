@@ -122,7 +122,7 @@ No background task calls provider model-list endpoints. The only recurring backg
 uv run pytest
 ```
 
-The operational suite covers quota reservations, reset-hour windows, separate request/token limits, true latency percentiles, model-cache behavior, malformed rate-limit headers, and Gemini request/stream translation. GitHub Actions runs tests on Python 3.12 plus critical Ruff checks; Pyright is included as a non-blocking advisory check while older modules are incrementally typed.
+The operational suite covers quota reservations, reset-hour windows, separate request/token limits, true latency percentiles, model-cache behavior, malformed rate-limit headers, and Gemini request/stream translation. GitHub Actions runs tests on Python 3.12 plus critical Ruff checks and required Pyright type checking.
 
 ## Project structure
 
