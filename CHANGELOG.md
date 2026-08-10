@@ -22,4 +22,4 @@
 - OpenAI-compatible tool, tool-choice, structured-output, and multimodal request fields.
 - Optional `ROUTER_API_KEY` protection for `/v1/*` endpoints.
 - Operational correctness regression suite.
-- Python 3.12 GitHub Actions CI with pytest, compile checks, Ruff critical checks, and advisory Pyright.
+- Python 3.12 GitHub Actions CI with pytest, compile checks, Ruff critical checks, and required Pyright type checking.
