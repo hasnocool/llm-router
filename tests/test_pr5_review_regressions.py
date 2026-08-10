@@ -25,8 +25,18 @@ def test_bare_provider_id_resolves_to_default_model() -> None:
     assert settings.resolve("huggingface") == ("huggingface", "hf-default")
 
 
-def test_model_alias_cannot_shadow_provider_id() -> None:
-    with pytest.raises(ConfigError, match="must not shadow provider ids"):
+def test_redundant_provider_alias_is_collapsed() -> None:
+    settings = Settings(
+        providers={"local": provider("Local", "granite")},
+        models={"local": ModelRoute(provider="local", model="granite")},
+    )
+
+    assert "local" not in settings.models
+    assert settings.resolve("local") == ("local", "granite")
+
+
+def test_ambiguous_model_alias_cannot_shadow_provider_id() -> None:
+    with pytest.raises(ConfigError, match="ambiguously shadow provider ids"):
         Settings(
             providers={"groq": provider("Groq", "groq-default")},
             models={"groq": ModelRoute(provider="groq", model="another-model")},
