@@ -390,12 +390,35 @@ class ModelRouter:
 
     async def list_models(self, *, force_refresh: bool = False) -> list[ModelInfo]:
         pool = self._routing_pool() or list(self.providers.keys())
-        results = await asyncio.gather(
-            *(self._refresh_models_for_provider(name, force=force_refresh) for name in pool),
-            return_exceptions=True,
-        )
         out: list[ModelInfo] = []
         seen: set[str] = set()
+
+        # By default return the small router-defined set (aliases, provider
+        # default models, and the virtual "auto" route) instead of polling
+        # providers for their full remote catalogs. Model pickers stay fast
+        # and unresponsive clients (e.g. OpenClaude /model) work. Pass
+        # force_refresh=True (GET /v1/models?refresh=true) for full discovery.
+        if not force_refresh:
+            for name in pool:
+                if name == "local" or not self.settings.provider(name).default_model:
+                    continue
+                out.append(ModelInfo(id=name, owned_by="router"))
+            for alias, route in self.settings.models.items():
+                if route.provider not in pool or alias in seen:
+                    continue
+                seen.add(alias)
+                out.append(ModelInfo(id=alias, owned_by="router"))
+            if "auto" not in seen:
+                seen.add("auto")
+                out.append(
+                    ModelInfo(id="auto", owned_by="router", created=int(time.time()))
+                )
+            return out
+
+        results = await asyncio.gather(
+            *(self._refresh_models_for_provider(name, force=True) for name in pool),
+            return_exceptions=True,
+        )
         for name, result in zip(pool, results):
             if isinstance(result, BaseException):
                 continue

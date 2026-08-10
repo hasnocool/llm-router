@@ -86,3 +86,23 @@ async def test_quota_exhaustion_fails_over_and_demotes_route() -> None:
         assert response.provider == "huggingface"
         assert response.choices[0].message.content == "from-hf"
         assert "groq" not in [provider for provider, _ in router._order(request())]
+
+
+async def test_zero_cost_auto_uses_best_eligible_default_model() -> None:
+    async with httpx.AsyncClient() as client:
+        router = ZeroCostModelRouter(make_settings(), client)
+        order = router._order(ChatRequest(model="auto", messages=[Message(role="user", content="hi")]))
+        assert order == [
+            ("groq", "groq-default"),
+            ("huggingface", "hf-default"),
+            ("local", "granite"),
+        ]
+
+
+async def test_zero_cost_auto_respects_routing_pool() -> None:
+    async with httpx.AsyncClient() as client:
+        settings = make_settings()
+        settings.routing_providers = ["huggingface"]
+        router = ZeroCostModelRouter(settings, client)
+        order = router._order(ChatRequest(model="auto", messages=[Message(role="user", content="hi")]))
+        assert order == [("huggingface", "hf-default")]

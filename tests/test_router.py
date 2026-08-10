@@ -340,9 +340,15 @@ class TestRoutingPool:
         models = await r.list_models()
         ids = [m.id for m in models]
         assert "local-m" not in ids
-        assert "m1" in ids and "m2" in ids
+        assert "m1" not in ids and "m2" not in ids
         assert "local-alias" not in ids
         assert "cloud-alias" in ids
+        assert "auto" in ids
+
+        # force_refresh performs full remote discovery
+        full = await r.list_models(force_refresh=True)
+        full_ids = [m.id for m in full]
+        assert "m1" in full_ids and "m2" in full_ids
 
     def test_routing_pool_rejects_unknown_provider(self, tmp_path):
         cfg = tmp_path / "config.toml"
