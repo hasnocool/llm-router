@@ -99,14 +99,19 @@ def load_settings(
     config_path: Path | None = None,
     env: dict[str, str] | None = None,
 ) -> Settings:
-    env = env if env is not None else dict(os.environ)
+    resolved_env: dict[str, str] = dict(os.environ) if env is None else dict(env)
     path = config_path or DEFAULT_CONFIG_PATH
     if not path.exists():
         raise ConfigError(f"config file not found: {path}")
 
     dotenv_path = path.parent / ".env"
     if dotenv_path.exists():
-        env = {**dotenv_values(dotenv_path), **env}
+        dotenv_env = {
+            key: value
+            for key, value in dotenv_values(dotenv_path).items()
+            if value is not None
+        }
+        resolved_env = {**dotenv_env, **resolved_env}
 
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
@@ -114,15 +119,15 @@ def load_settings(
     providers: dict[str, ProviderConfig] = {}
     for name, pc in raw.get("providers", {}).items():
         base = pc.get("base_url", "")
-        if env.get("LOCAL_BASE_URL") and name == "local":
-            base = env["LOCAL_BASE_URL"]
+        if resolved_env.get("LOCAL_BASE_URL") and name == "local":
+            base = resolved_env["LOCAL_BASE_URL"]
         providers[name] = ProviderConfig(
             name=pc.get("name", name),
             base_url=base.rstrip("/"),
             default_model=pc.get("default_model", ""),
             timeout_seconds=pc.get("timeout_seconds", raw.get("timeout_seconds", 60.0)),
             stream_timeout_seconds=pc.get("stream_timeout_seconds", 240.0),
-            api_key=env.get(pc["api_key_env"]) if pc.get("api_key_env") else None,
+            api_key=resolved_env.get(pc["api_key_env"]) if pc.get("api_key_env") else None,
         )
 
     models = {
@@ -159,7 +164,7 @@ def load_settings(
         models=models,
         quotas=quotas,
         metrics=metrics,
-        host=env.get("HOST", "0.0.0.0"),
-        port=int(env.get("PORT", "8000")),
-        router_api_key=env.get("ROUTER_API_KEY") or None,
+        host=resolved_env.get("HOST", "0.0.0.0"),
+        port=int(resolved_env.get("PORT", "8000")),
+        router_api_key=resolved_env.get("ROUTER_API_KEY") or None,
     )
