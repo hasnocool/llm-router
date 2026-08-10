@@ -11,8 +11,10 @@ from ..metrics_db import get_metrics_db
 from ..rate_limits import RateLimitParser, extract_usage_from_response
 
 # HTTP statuses that indicate the provider is unavailable (retryable/failover).
-# Anything else (400/401/403/404/422) is a client error and never triggers failover.
-RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+# 402 (payment required) is included so auto/fallback routing skips providers
+# whose billing/quota prevents them from serving. Anything else (400/401/403/
+# 404/422) is a client error and never triggers failover.
+RETRYABLE_STATUSES = {402, 429, 500, 502, 503, 504}
 
 FORWARDED_REQUEST_HEADERS: ContextVar[dict[str, str]] = ContextVar(
     "forwarded_request_headers", default={}

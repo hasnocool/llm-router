@@ -213,6 +213,12 @@ class ModelRouter:
 
     # --- routing ------------------------------------------------------
 
+    def _routing_pool(self) -> list[str]:
+        """Providers eligible for automatic/fallback routing (not explicit requests)."""
+        if self.settings.routing_providers:
+            return [n for n in self.settings.routing_providers if n in self.providers]
+        return list(self.providers.keys())
+
     def _order(self, req: ChatRequest) -> list[tuple[str, str]]:
         """Return ordered [(provider_name, model_id)] to attempt."""
         local_first = (
@@ -238,13 +244,39 @@ class ModelRouter:
                 model = self.settings.provider(name).default_model
             return [(name, model)]
 
+        # Auto-selection: "auto" (or an empty model string) picks the best-ranked
+        # available provider in the routing pool using its default model, with
+        # failover through the rest.
+        if not req.model or req.model.lower() in {"auto", "best", "*"}:
+            pool = self._routing_pool()
+            ranked = self.ranked_providers()
+            candidates = [n for n in pool if n in available]
+            order_names = [
+                s.name
+                for s in ranked
+                if s.name in candidates and self.settings.provider(s.name).default_model
+            ]
+            order_names += [
+                n for n in candidates
+                if n not in order_names and self.settings.provider(n).default_model
+            ]
+            if local_first:
+                order_names = sorted(order_names, key=lambda n: (n != "local",))
+            return [
+                (n, self.settings.provider(n).default_model)
+                for n in order_names
+            ]
+
         primary, model = self.settings.resolve(req.model or "qwen3-8b")
 
-        # Build fallback order: primary first, then ranked available providers
+        # Build fallback order: primary first, then ranked available providers.
+        # The primary provider wins; if it isn't in the routing pool, only the
+        # pool is used for fallback so off-limit providers never receive traffic.
+        pool = self._routing_pool()
         ranked = self.ranked_providers()
         order_names = [primary]
         for s in ranked:
-            if s.name != primary and s.name in available:
+            if s.name != primary and s.name in available and s.name in pool:
                 order_names.append(s.name)
         if local_first:
             order_names = sorted(order_names, key=lambda n: (n != "local",))
@@ -353,7 +385,8 @@ class ModelRouter:
     async def list_models(self) -> list[ModelInfo]:
         out: list[ModelInfo] = []
         seen: set[str] = set()
-        for name in self.providers:
+        pool = self._routing_pool() or list(self.providers.keys())
+        for name in pool:
             provider = self.providers[name]
             try:
                 data = await provider.models()
@@ -367,10 +400,21 @@ class ModelRouter:
                 out.append(
                     ModelInfo(id=f"{name}:{mid}" if name == "local" else mid, owned_by=name)
                 )
-        for alias in self.settings.models:
-            if alias not in seen:
-                seen.add(alias)
-                out.append(ModelInfo(id=alias, owned_by="router"))
+        for alias, route in self.settings.models.items():
+            if route.provider not in pool or alias in seen:
+                continue
+            seen.add(alias)
+            out.append(ModelInfo(id=alias, owned_by="router"))
+        # Virtual "auto" model: routes to the best-ranked available provider.
+        if "auto" not in seen:
+            seen.add("auto")
+            out.append(
+                ModelInfo(
+                    id="auto",
+                    owned_by="router",
+                    created=int(time.time()),
+                )
+            )
         return out
 
     # --- metrics endpoints --------------------------------------------

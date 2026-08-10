@@ -55,6 +55,10 @@ class Settings:
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     host: str = "0.0.0.0"
     port: int = 8000
+    # Providers allowed to participate in automatic/fallback routing. Empty/None
+    # means all configured providers are eligible. Explicit "provider:model"
+    # requests always work regardless of this list.
+    routing_providers: list[str] = field(default_factory=list)
 
     def provider(self, name: str) -> ProviderConfig:
         try:
@@ -140,6 +144,17 @@ def load_settings(
         report_interval_seconds=metrics_raw.get("report_interval_seconds", 300),
     )
 
+    routing_raw = raw.get("routing", {})
+    routing_providers = []
+    for name in routing_raw.get("providers", []):
+        normalized = normalize_provider(name)
+        if normalized not in providers:
+            raise ConfigError(
+                f"[routing] providers references unknown provider {name!r}; "
+                f"configured providers: {', '.join(providers)}"
+            )
+        routing_providers.append(normalized)
+
     return Settings(
         strategy=raw.get("strategy", "cloud-first"),
         timeout_seconds=raw.get("timeout_seconds", 60.0),
@@ -149,4 +164,5 @@ def load_settings(
         metrics=metrics,
         host=env.get("HOST", "0.0.0.0"),
         port=int(env.get("PORT", "8000")),
+        routing_providers=routing_providers,
     )
