@@ -140,7 +140,10 @@ def test_model_discovery_is_cached_and_background_start_does_not_probe(tmp_path)
             await asyncio.sleep(0)
             assert counter.calls == 0
             await router.list_models()
-            await router.list_models()
+            assert counter.calls == 0
+            await router.list_models(force_refresh=True)
+            assert counter.calls == 1
+            await router._refresh_models_for_provider("huggingface")
             assert counter.calls == 1
             await router.stop_background_tasks()
 

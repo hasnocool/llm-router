@@ -62,6 +62,27 @@ class ZeroCostModelRouter(ModelRouter):
             return super()._order(req)
 
         primary, primary_model = self.settings.resolve(req.model or "qwen3-8b")
+
+        # "auto" (or an empty model string) picks the best-ranked eligible
+        # provider in the routing pool using its default model, with failover.
+        if not req.model or req.model.lower() in {"auto", "best", "*"}:
+            pool = self._routing_pool()
+            scores = [
+                score for score in self.route_scores()
+                if score.provider in pool
+                and self.settings.provider(score.provider).default_model
+            ]
+            names = [score.provider for score in scores]
+            if req.local_first is True and "local" in names:
+                names.remove("local")
+                names.insert(0, "local")
+            elif req.local_first is False and "local" in names:
+                names = [name for name in names if name != "local"] + ["local"]
+            return [
+                (name, self.settings.provider(name).default_model)
+                for name in names
+            ]
+
         scores = [score for score in self.route_scores(primary=primary) if score.eligible]
         names = [score.provider for score in scores]
 
