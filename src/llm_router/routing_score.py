@@ -113,23 +113,30 @@ def static_zero_cost_score(provider: Mapping[str, Any] | ProviderMatrixEntry) ->
     else:
         p = provider
 
-    score = {"recurring": 30, "trial": 12, "conditional": 7}.get(p.get("free_class"), 0)
+    free_class = str(p.get("free_class") or "")
+    router_eligible = str(p.get("router_eligible") or "none")
+    openai_compatible = str(p.get("openai_compatible") or "unknown")
+    cli_support = str(p.get("cli_support") or "unknown")
+    tool_calling = p.get("tool_calling")
+
+    score = {"recurring": 30, "trial": 12, "conditional": 7}.get(free_class, 0)
     score += {"direct": 15, "self_host": 9, "indirect": 5, "none": 0}.get(
-        p.get("router_eligible", "none"), 0
+        router_eligible, 0
     )
     score += {"yes": 8, "partial": 4, "no": 0, "unknown": 1}.get(
-        p.get("openai_compatible"), 0
+        openai_compatible, 0
     )
-    score += {
+    tool_scores: dict[object, int] = {
         True: 7,
         "yes": 7,
         "model-dependent": 4,
         "partial": 3,
         False: 0,
         "unknown": 1,
-    }.get(p.get("tool_calling"), 0)
+    }
+    score += tool_scores.get(tool_calling, 0)
     score += {"native": 6, "api-compatible": 4, "indirect": 2, "none": 0, "unknown": 1}.get(
-        p.get("cli_support"), 0
+        cli_support, 0
     )
     score += round(float(p.get("coding_quality") or 0) * 4)
 
@@ -164,11 +171,12 @@ def static_zero_cost_score(provider: Mapping[str, Any] | ProviderMatrixEntry) ->
     if "may be used" in privacy or "may train" in privacy or "improve models" in privacy:
         score -= 3
 
-    if p.get("status") != "active":
+    if str(p.get("status") or "") != "active":
         score -= 50
-    if p.get("free_class") == "trial":
+    if free_class == "trial":
         score -= 3
-    notes = " ".join(map(str, p.get("notes", ())))
+    notes_value = p.get("notes", ())
+    notes = " ".join(map(str, notes_value if isinstance(notes_value, (list, tuple)) else (notes_value,)))
     if "limited time" in notes.lower():
         score -= 4
 
@@ -310,7 +318,6 @@ def runtime_route_score(
 
 
 def route_sort_key(route: RouteScore) -> tuple[int, int, float, float, str]:
-    # Renewable third-party quotas are exhausted before local compute and finite trials.
     class_priority = {"recurring": 0, "local": 1, "trial": 2, "conditional": 3, "unknown": 8}
     return (
         0 if route.eligible else 1,

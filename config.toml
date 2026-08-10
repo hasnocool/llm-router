@@ -83,42 +83,17 @@ stream_timeout_seconds = 240.0
 # db_path = "metrics.db"
 flush_interval_seconds = 30
 retention_days = 30
-report_interval_seconds = 30
+report_interval_seconds = 300
+# /models is never used as a background heartbeat. Explicit discovery is cached.
+model_cache_ttl_seconds = 21600
+model_failure_backoff_seconds = 300
+model_failure_backoff_max_seconds = 3600
 
-# Local quota guards. Provider-side rate-limit headers are also observed at
-# runtime. These values are safety caps, not claims that every model receives
-# this exact provider quota.
-[quotas.huggingface]
-daily_requests = 10000
-daily_tokens = 1000000
-reset_hour = 0
-
-# Cerebras is classified as a finite trial in the provider matrix and is
-# excluded by zero-cost policy unless LLM_ROUTER_INCLUDE_TRIALS=true.
-[quotas.cerebras]
-daily_requests = 5000
-daily_tokens = 500000
-reset_hour = 0
-
-# Conservative guard for the configured llama-3.3-70b-versatile free route.
-[quotas.groq]
-daily_requests = 1000
-daily_tokens = 100000
-reset_hour = 0
-
-# NVIDIA hosted NIM trial routes are finite and excluded by default.
-[quotas.nvidia]
-daily_requests = 5000
-daily_tokens = 500000
-reset_hour = 0
-
-[quotas.google_ai]
-daily_requests = 1000
-daily_tokens = 100000
-reset_hour = 0
-
-# Local provider typically has no quota.
-# [quotas.local]
-# daily_requests = 100000
-# daily_tokens = 10000000
-# reset_hour = 0
+# Provider quotas are frequently model/tier/account-specific and change over time.
+# The router learns provider-side request/token windows from response headers.
+# Configure an optional local safety guard only when you know the exact limit:
+#
+# [quotas.groq]
+# daily_requests = 1000
+# daily_tokens = 100000
+# reset_hour = 0  # UTC
