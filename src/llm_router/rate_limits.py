@@ -1,8 +1,14 @@
+# src/llm_router/rate_limits.py
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from email.utils import parsedate_to_datetime
+from typing import Any, Mapping
+
+
+_DURATION_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?)(?P<unit>ms|s|m|h)", re.IGNORECASE)
 
 
 @dataclass
@@ -14,152 +20,118 @@ class RateLimitData:
     header_source: str
 
 
+def _safe_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(float(value.strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_reset_timestamp(value: str | None, *, now: float | None = None) -> int | None:
+    """Parse epoch, seconds-from-now, duration strings, or HTTP dates defensively."""
+    if not value:
+        return None
+    now_value = now if now is not None else time.time()
+    text = value.strip()
+
+    numeric = _safe_int(text)
+    if numeric is not None:
+        return numeric if numeric > 100_000_000 else int(now_value + max(0, numeric))
+
+    total_seconds = 0.0
+    matches = list(_DURATION_RE.finditer(text))
+    if matches and "".join(match.group(0) for match in matches).lower() == text.lower():
+        multipliers = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+        for match in matches:
+            total_seconds += float(match.group("value")) * multipliers[match.group("unit").lower()]
+        return int(now_value + total_seconds)
+
+    try:
+        return int(parsedate_to_datetime(text).timestamp())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def retry_after_timestamp(headers: Mapping[str, str]) -> int | None:
+    return parse_reset_timestamp(headers.get("retry-after"))
+
+
 class RateLimitParser:
-    """Parse rate limit headers from different provider responses."""
+    """Parse rate-limit headers without allowing telemetry errors to break requests."""
 
     @staticmethod
-    def parse_openai_compatible(headers: dict[str, str]) -> list[RateLimitData]:
-        """Parse OpenAI-compatible rate limit headers (NVIDIA, Cerebras, Groq, Local)."""
-        results = []
-
-        # Requests remaining
-        req_remaining = headers.get("x-ratelimit-remaining-requests")
-        req_limit = headers.get("x-ratelimit-limit-requests")
-        req_reset = headers.get("x-ratelimit-reset-requests") or headers.get(
-            "x-ratelimit-reset"
+    def _build(
+        *,
+        limit_type: str,
+        remaining: str | None,
+        limit: str | None,
+        reset: str | None,
+        source: str,
+    ) -> RateLimitData | None:
+        parsed_remaining = _safe_int(remaining)
+        if parsed_remaining is None:
+            return None
+        return RateLimitData(
+            limit_type=limit_type,
+            limit_value=_safe_int(limit),
+            remaining=parsed_remaining,
+            reset_timestamp=parse_reset_timestamp(reset),
+            header_source=source,
         )
 
-        if req_remaining is not None:
-            results.append(
-                RateLimitData(
-                    limit_type="requests",
-                    limit_value=int(req_limit) if req_limit else None,
-                    remaining=int(req_remaining),
-                    reset_timestamp=int(req_reset) if req_reset else None,
-                    header_source="x-ratelimit-remaining-requests",
-                )
-            )
-
-        # Tokens remaining
-        tok_remaining = headers.get("x-ratelimit-remaining-tokens")
-        tok_limit = headers.get("x-ratelimit-limit-tokens")
-        tok_reset = headers.get("x-ratelimit-reset-tokens") or headers.get(
-            "x-ratelimit-reset"
+    @classmethod
+    def parse_openai_compatible(cls, headers: Mapping[str, str]) -> list[RateLimitData]:
+        results: list[RateLimitData] = []
+        request_limit = cls._build(
+            limit_type="requests",
+            remaining=headers.get("x-ratelimit-remaining-requests"),
+            limit=headers.get("x-ratelimit-limit-requests"),
+            reset=headers.get("x-ratelimit-reset-requests") or headers.get("x-ratelimit-reset"),
+            source="x-ratelimit-remaining-requests",
         )
-
-        if tok_remaining is not None:
-            results.append(
-                RateLimitData(
-                    limit_type="tokens",
-                    limit_value=int(tok_limit) if tok_limit else None,
-                    remaining=int(tok_remaining),
-                    reset_timestamp=int(tok_reset) if tok_reset else None,
-                    header_source="x-ratelimit-remaining-tokens",
-                )
-            )
-
-        return results
-
-    @staticmethod
-    def parse_huggingface(headers: dict[str, str]) -> list[RateLimitData]:
-        """Parse HuggingFace rate limit headers."""
-        results = []
-
-        remaining = headers.get("x-ratelimit-remaining")
-        limit = headers.get("x-ratelimit-limit")
-        reset = headers.get("x-ratelimit-reset")
-
-        if remaining is not None:
-            results.append(
-                RateLimitData(
-                    limit_type="requests",
-                    limit_value=int(limit) if limit else None,
-                    remaining=int(remaining),
-                    reset_timestamp=int(reset) if reset else None,
-                    header_source="x-ratelimit-remaining",
-                )
-            )
-
-        return results
-
-    @staticmethod
-    def parse_google_ai(headers: dict[str, str]) -> list[RateLimitData]:
-        """Parse Google AI rate limit headers."""
-        results = []
-
-        remaining = headers.get("x-ratelimit-remaining")
-        limit = headers.get("x-ratelimit-limit")
-        reset = headers.get("x-ratelimit-reset")
-
-        if remaining is not None:
-            results.append(
-                RateLimitData(
-                    limit_type="requests",
-                    limit_value=int(limit) if limit else None,
-                    remaining=int(remaining),
-                    reset_timestamp=int(reset) if reset else None,
-                    header_source="x-ratelimit-remaining",
-                )
-            )
-
-        return results
-
-    @staticmethod
-    def parse_generic(headers: dict[str, str]) -> list[RateLimitData]:
-        """Try to parse any recognizable rate limit headers."""
-        results = []
-
-        # Standard headers
-        for prefix in ["x-ratelimit", "ratelimit"]:
-            remaining_key = f"{prefix}-remaining"
-            limit_key = f"{prefix}-limit"
-            reset_key = f"{prefix}-reset"
-
-            if remaining_key in headers:
-                results.append(
-                    RateLimitData(
-                        limit_type="requests",
-                        limit_value=int(headers[limit_key])
-                        if limit_key in headers
-                        else None,
-                        remaining=int(headers[remaining_key]),
-                        reset_timestamp=int(headers[reset_key])
-                        if reset_key in headers
-                        else None,
-                        header_source=remaining_key,
-                    )
-                )
-
+        token_limit = cls._build(
+            limit_type="tokens",
+            remaining=headers.get("x-ratelimit-remaining-tokens"),
+            limit=headers.get("x-ratelimit-limit-tokens"),
+            reset=headers.get("x-ratelimit-reset-tokens") or headers.get("x-ratelimit-reset"),
+            source="x-ratelimit-remaining-tokens",
+        )
+        if request_limit:
+            results.append(request_limit)
+        if token_limit:
+            results.append(token_limit)
         return results
 
     @classmethod
-    def parse_for_provider(
-        cls, provider: str, headers: dict[str, str]
-    ) -> list[RateLimitData]:
-        """Parse rate limit headers for a specific provider."""
-        parser_map = {
-            "huggingface": cls.parse_huggingface,
-            "google_ai": cls.parse_google_ai,
-            "nvidia": cls.parse_openai_compatible,
-            "cerebras": cls.parse_openai_compatible,
-            "groq": cls.parse_openai_compatible,
-            "local": cls.parse_openai_compatible,
-        }
+    def parse_single_window(cls, headers: Mapping[str, str]) -> list[RateLimitData]:
+        item = cls._build(
+            limit_type="requests",
+            remaining=headers.get("x-ratelimit-remaining") or headers.get("ratelimit-remaining"),
+            limit=headers.get("x-ratelimit-limit") or headers.get("ratelimit-limit"),
+            reset=headers.get("x-ratelimit-reset") or headers.get("ratelimit-reset"),
+            source=(
+                "x-ratelimit-remaining"
+                if headers.get("x-ratelimit-remaining") is not None
+                else "ratelimit-remaining"
+            ),
+        )
+        return [item] if item else []
 
-        parser = parser_map.get(provider, cls.parse_generic)
-        return parser(headers)
+    @classmethod
+    def parse_for_provider(cls, provider: str, headers: Mapping[str, str]) -> list[RateLimitData]:
+        if provider in {"nvidia", "cerebras", "groq", "local"}:
+            return cls.parse_openai_compatible(headers)
+        return cls.parse_single_window(headers)
 
 
 def extract_usage_from_response(data: dict[str, Any]) -> tuple[int, int]:
-    """Extract prompt and completion tokens from provider response."""
     usage = data.get("usage", {})
-    prompt_tokens = usage.get("prompt_tokens", 0)
-    completion_tokens = usage.get("completion_tokens", 0)
-    return prompt_tokens, completion_tokens
+    return int(usage.get("prompt_tokens", 0) or 0), int(usage.get("completion_tokens", 0) or 0)
 
 
 def extract_usage_from_streaming_chunk(line: str) -> tuple[int, int] | None:
-    """Extract token usage from a streaming SSE line."""
     if not line.startswith("data:"):
         return None
     payload = line[5:].strip()
@@ -171,7 +143,9 @@ def extract_usage_from_streaming_chunk(line: str) -> tuple[int, int] | None:
         obj = json.loads(payload)
         usage = obj.get("usage")
         if usage:
-            return usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
-    except Exception:
-        pass
+            return int(usage.get("prompt_tokens", 0) or 0), int(
+                usage.get("completion_tokens", 0) or 0
+            )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
     return None
