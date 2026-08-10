@@ -27,5 +27,4 @@ jobs:
       - name: Tests
         run: pytest -q
       - name: Pyright
-        continue-on-error: true
         run: pyright src
