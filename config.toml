@@ -5,6 +5,12 @@
 #   "local-first" -> try local, fail over to cloud on error/timeout
 strategy = "cloud-first"
 
+# Only these providers participate in automatic/fallback routing and in the
+# /v1/models list (so OpenClaude only offers these). Explicit "provider:model"
+# requests still work for any configured provider.
+[routing]
+providers = ["huggingface"]
+
 # Seconds to wait before treating a non-streaming call as failed (per provider).
 timeout_seconds = 60.0
 
@@ -63,8 +69,10 @@ stream_timeout_seconds = 240.0
 "qwen2.5-7b" = { provider = "huggingface", model = "Qwen/Qwen2.5-7B-Instruct" }
 "llama-3.1-8b" = { provider = "huggingface", model = "meta-llama/Llama-3.1-8B-Instruct" }
 "deepseek-r1-7b" = { provider = "huggingface", model = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" }
-"granite" = { provider = "local", model = "granite-3.3-2b-instruct" }
-"local" = { provider = "local", model = "granite-3.3-2b-instruct" }
+# Local aliases removed: routing is HuggingFace-only (see [routing]).
+
+# Special value: "auto" (or empty model string) routes to the best-ranked
+# available provider using its default model, with failover through the rest.
 
 # Metrics configuration
 [metrics]

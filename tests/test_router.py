@@ -88,6 +88,54 @@ class TestOrdering:
         ]
 
 
+class TestAutoSelection:
+    def test_auto_uses_ranked_defaults(self):
+        r = make_router(make_settings(), None)
+        assert r._order(req("auto")) == [
+            ("huggingface", "hf-default"),
+            ("local", "granite"),
+        ]
+
+    def test_empty_model_auto(self):
+        r = make_router(make_settings(), None)
+        assert r._order(req("")) == [("huggingface", "hf-default"), ("local", "granite")]
+
+    def test_auto_honors_local_first(self):
+        r = make_router(make_settings(), None)
+        assert r._order(req("auto", local_first=True)) == [
+            ("local", "granite"),
+            ("huggingface", "hf-default"),
+        ]
+
+    async def test_auto_fails_over_to_next_available(self):
+        calls = []
+
+        async def handler(request):
+            calls.append(request.url.host)
+            if len(calls) == 1:
+                return json_response({}, status=503)
+            return json_response(ok_body("granite", "from-local"))
+
+        r = make_router(make_settings(), httpx.MockTransport(handler))
+        resp = await r.complete(req("auto"))
+        assert resp.provider == "local"
+        assert resp.choices[0].message.content == "from-local"
+
+    async def test_402_fails_over(self):
+        calls = []
+
+        async def handler(request):
+            calls.append(request.url.host)
+            if len(calls) == 1:
+                return json_response({"error": "payment required"}, status=402)
+            return json_response(ok_body("granite", "paid-local"))
+
+        r = make_router(make_settings(), httpx.MockTransport(handler))
+        resp = await r.complete(req())
+        assert resp.provider == "local"
+        assert resp.choices[0].message.content == "paid-local"
+
+
 class TestFailover:
     async def test_failover_to_local(self):
         calls = []
@@ -226,3 +274,64 @@ qwen = { provider = "huggingface", model = "Qwen/Qwen3-8B" }
         assert s.resolve("qwen") == ("huggingface", "Qwen/Qwen3-8B")
         assert s.resolve("hf:Some/Model") == ("huggingface", "Some/Model")
         assert "nvidia" in s.providers
+
+    def test_load_settings_routing_pool(self, tmp_path):
+        cfg = tmp_path / "config.toml"
+        cfg.write_text(
+            """
+[routing]
+providers = ["hf"]
+
+[providers.huggingface]
+base_url = "https://router.huggingface.co/v1"
+default_model = "Qwen/Qwen3-8B"
+api_key_env = "HF_TOKEN"
+
+[providers.local]
+base_url = "http://localhost:8081"
+default_model = "granite"
+"""
+        )
+        s = load_settings(cfg, env={"HF_TOKEN": "hf_test"})
+        assert s.routing_providers == ["huggingface"]
+
+
+class TestRoutingPool:
+    def make_pooled(self) -> Settings:
+        s = make_settings()
+        s.routing_providers = ["huggingface"]
+        return s
+
+    def test_auto_only_uses_pool(self):
+        r = make_router(self.make_pooled(), None)
+        assert r._order(req("auto")) == [("huggingface", "hf-default")]
+
+    def test_normal_fallback_only_uses_pool(self):
+        r = make_router(self.make_pooled(), None)
+        assert r._order(req("cloud-alias")) == [("huggingface", "Qwen/Qwen3-8B")]
+
+    def test_primary_outside_pool_still_routes(self):
+        s = make_settings()
+        s.routing_providers = ["huggingface"]
+        r = make_router(s, None)
+        assert r._order(req("local-alias"))[0] == ("local", "granite")
+
+    def test_explicit_provider_bypasses_pool(self):
+        s = make_settings()
+        s.routing_providers = ["huggingface"]
+        r = make_router(s, None)
+        assert r._order(req("local:granite")) == [("local", "granite")]
+
+    async def test_list_models_respects_pool(self):
+        async def handler(request):
+            if request.url.host == "hf.example":
+                return json_response({"data": [{"id": "m1"}, {"id": "m2"}]})
+            return json_response({"data": [{"id": "local-m"}]})
+
+        s = make_settings()
+        s.routing_providers = ["huggingface"]
+        r = make_router(s, httpx.MockTransport(handler))
+        models = await r.list_models()
+        ids = [m.id for m in models]
+        assert "local-m" not in ids
+        assert "m1" in ids and "m2" in ids
