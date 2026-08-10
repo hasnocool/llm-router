@@ -1,3 +1,4 @@
+# src/llm_router/providers/google_ai.py
 from __future__ import annotations
 
 import json
@@ -7,26 +8,23 @@ from typing import Any, AsyncIterator
 
 import httpx
 
+from ..async_metrics import AsyncMetricsStore
 from ..config import ProviderConfig
-from ..metrics_db import get_metrics_db
-from ..rate_limits import RateLimitParser, extract_usage_from_response
-from .base import (
-    Provider,
-    ProviderRequestError,
-    ProviderUnavailable,
-    QuotaExceededError,
-    RETRYABLE_STATUSES,
-    get_forwarded_request_headers,
-)
+from .base import Provider, ProviderRequestError, ProviderUnavailable, get_forwarded_request_headers
 
 
 class GoogleAIProvider(Provider):
-    """Google AI (Gemini) provider using the generativelanguage REST API."""
+    """Gemini REST adapter normalized to the OpenAI chat-completions contract."""
 
     def __init__(
-        self, name: str, config: ProviderConfig, http: httpx.AsyncClient, metrics_db=None
+        self,
+        name: str,
+        config: ProviderConfig,
+        http: httpx.AsyncClient,
+        metrics_store: AsyncMetricsStore | None = None,
+        metrics_db: AsyncMetricsStore | None = None,
     ):
-        super().__init__(name, config, http, metrics_db)
+        super().__init__(name, config, http, metrics_store=metrics_store, metrics_db=metrics_db)
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -38,198 +36,339 @@ class GoogleAIProvider(Provider):
     def _url(self, path: str) -> str:
         return f"https://generativelanguage.googleapis.com/v1beta/{path}"
 
-    def _check(self, resp: httpx.Response) -> None:
-        if resp.status_code in RETRYABLE_STATUSES:
-            raise ProviderUnavailable(
-                f"{self.name} returned HTTP {resp.status_code}",
-                status_code=resp.status_code,
-            )
-        if resp.status_code >= 400:
-            raise ProviderRequestError(
-                f"{self.name} returned HTTP {resp.status_code}",
-                status_code=resp.status_code,
-                body=resp.text[:2000],
-            )
+    @staticmethod
+    def _normalize_model(model: str) -> str:
+        return model if model.startswith("models/") else f"models/{model}"
 
-    def _gemini_to_openai(self, data: dict, model: str) -> dict:
-        """Convert Gemini generateContent response to OpenAI chat.completion format."""
-        candidates = data.get("candidates", [])
-        if not candidates:
-            return {
-                "id": f"chatcmpl-google-{uuid.uuid4().hex[:12]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": ""},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": data.get("usageMetadata", {}).get(
-                        "promptTokenCount", 0
-                    ),
-                    "completion_tokens": data.get("usageMetadata", {}).get(
-                        "candidatesTokenCount", 0
-                    ),
-                    "total_tokens": data.get("usageMetadata", {}).get(
-                        "totalTokenCount", 0
-                    ),
-                },
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            chunks: list[str] = []
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    chunks.append(part["text"])
+            return "".join(chunks)
+        return str(content or "")
+
+    def _openai_to_gemini_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        system_parts: list[dict[str, str]] = []
+        contents: list[dict[str, Any]] = []
+        tool_names: dict[str, str] = {}
+
+        for message in payload.get("messages", []):
+            role = message.get("role", "user")
+            if role == "system":
+                system_parts.append({"text": self._content_to_text(message.get("content", ""))})
+                continue
+
+            if role == "assistant":
+                gemini_parts: list[dict[str, Any]] = []
+                text = self._content_to_text(message.get("content", ""))
+                if text:
+                    gemini_parts.append({"text": text})
+                for call in message.get("tool_calls") or []:
+                    function = call.get("function") or {}
+                    name = function.get("name")
+                    if not name:
+                        continue
+                    call_id = call.get("id")
+                    if call_id:
+                        tool_names[call_id] = name
+                    arguments = function.get("arguments", {})
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            arguments = {"raw": arguments}
+                    gemini_parts.append({"functionCall": {"name": name, "args": arguments or {}}})
+                contents.append({"role": "model", "parts": gemini_parts or [{"text": ""}]})
+                continue
+
+            if role == "tool":
+                name = message.get("name") or tool_names.get(message.get("tool_call_id", "")) or "tool"
+                response = message.get("content", "")
+                if isinstance(response, str):
+                    try:
+                        parsed: Any = json.loads(response)
+                    except json.JSONDecodeError:
+                        parsed = {"content": response}
+                else:
+                    parsed = response
+                contents.append({
+                    "role": "user",
+                    "parts": [{"functionResponse": {"name": name, "response": parsed}}],
+                })
+                continue
+
+            contents.append({
+                "role": "user",
+                "parts": [{"text": self._content_to_text(message.get("content", ""))}],
+            })
+
+        gemini: dict[str, Any] = {"contents": contents}
+        if system_parts:
+            gemini["systemInstruction"] = {"parts": system_parts}
+
+        generation: dict[str, Any] = {}
+        mappings = {
+            "temperature": "temperature",
+            "max_tokens": "maxOutputTokens",
+            "top_p": "topP",
+            "frequency_penalty": "frequencyPenalty",
+            "presence_penalty": "presencePenalty",
+        }
+        for source, target in mappings.items():
+            if payload.get(source) is not None:
+                generation[target] = payload[source]
+        stop = payload.get("stop")
+        if stop:
+            generation["stopSequences"] = [stop] if isinstance(stop, str) else stop
+        response_format = payload.get("response_format") or {}
+        if isinstance(response_format, dict) and response_format.get("type") in {"json_object", "json_schema"}:
+            generation["responseMimeType"] = "application/json"
+        if generation:
+            gemini["generationConfig"] = generation
+
+        function_declarations = []
+        for tool in payload.get("tools") or []:
+            if tool.get("type") != "function":
+                continue
+            function = tool.get("function") or {}
+            declaration = {
+                "name": function.get("name"),
+                "description": function.get("description", ""),
+                "parameters": function.get("parameters") or {"type": "object", "properties": {}},
             }
-        parts = candidates[0].get("content", {}).get("parts", [])
-        text = "".join(p.get("text", "") for p in parts)
+            if declaration["name"]:
+                function_declarations.append(declaration)
+        if function_declarations:
+            gemini["tools"] = [{"functionDeclarations": function_declarations}]
+
+        tool_choice = payload.get("tool_choice")
+        if tool_choice == "none":
+            gemini["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
+        elif tool_choice == "required":
+            gemini["toolConfig"] = {"functionCallingConfig": {"mode": "ANY"}}
+        elif isinstance(tool_choice, dict):
+            name = (tool_choice.get("function") or {}).get("name")
+            if name:
+                gemini["toolConfig"] = {
+                    "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]}
+                }
+        return gemini
+
+    @staticmethod
+    def _usage(data: dict[str, Any]) -> tuple[int, int]:
+        metadata = data.get("usageMetadata") or {}
+        return int(metadata.get("promptTokenCount", 0) or 0), int(metadata.get("candidatesTokenCount", 0) or 0)
+
+    @staticmethod
+    def _finish_reason(reason: str | None) -> str:
+        return {
+            "STOP": "stop",
+            "MAX_TOKENS": "length",
+            "SAFETY": "content_filter",
+            "RECITATION": "content_filter",
+        }.get(reason or "", "stop")
+
+    def _gemini_to_openai(self, data: dict[str, Any], model: str) -> dict[str, Any]:
+        candidate = (data.get("candidates") or [{}])[0]
+        parts = (candidate.get("content") or {}).get("parts") or []
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        for part in parts:
+            if isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+            call = part.get("functionCall")
+            if call:
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {
+                        "name": call.get("name", ""),
+                        "arguments": json.dumps(call.get("args") or {}, separators=(",", ":")),
+                    },
+                })
+        prompt_tokens, completion_tokens = self._usage(data)
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         return {
             "id": f"chatcmpl-google-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
-                }
-            ],
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": self._finish_reason(candidate.get("finishReason")),
+            }],
             "usage": {
-                "prompt_tokens": data.get("usageMetadata", {}).get(
-                    "promptTokenCount", 0
-                ),
-                "completion_tokens": data.get("usageMetadata", {}).get(
-                    "candidatesTokenCount", 0
-                ),
-                "total_tokens": data.get("usageMetadata", {}).get(
-                    "totalTokenCount", 0
-                ),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
             },
         }
 
-    def _openai_to_gemini_payload(self, payload: dict) -> dict:
-        """Convert OpenAI chat.completion request to Gemini generateContent format."""
-        messages = payload.get("messages", [])
-        contents = []
-        for m in messages:
-            role = m.get("role", "user")
-            if role == "system":
-                role = "user"
-            contents.append({"role": role, "parts": [{"text": m.get("content", "")}]})
-        gemini = {"contents": contents}
-        gen_config = {}
-        if payload.get("temperature") is not None:
-            gen_config["temperature"] = payload["temperature"]
-        if payload.get("max_tokens") is not None:
-            gen_config["maxOutputTokens"] = payload["max_tokens"]
-        if payload.get("top_p") is not None:
-            gen_config["topP"] = payload["top_p"]
-        if gen_config:
-            gemini["generationConfig"] = gen_config
-        return gemini
-
-    def _normalize_model(self, model: str) -> str:
-        """Ensure model name has the models/ prefix for Gemini API."""
-        if not model.startswith("models/"):
-            return f"models/{model}"
-        return model
-
-    def _extract_gemini_usage(self, data: dict) -> tuple[int, int]:
-        """Extract token usage from Gemini response."""
-        return (
-            data.get("usageMetadata", {}).get("promptTokenCount", 0),
-            data.get("usageMetadata", {}).get("candidatesTokenCount", 0),
-        )
+    def _gemini_stream_chunk(self, data: dict[str, Any], model: str) -> str | None:
+        candidate = (data.get("candidates") or [{}])[0]
+        parts = (candidate.get("content") or {}).get("parts") or []
+        delta: dict[str, Any] = {}
+        text = "".join(part.get("text", "") for part in parts if isinstance(part.get("text"), str))
+        if text:
+            delta["content"] = text
+        tool_deltas = []
+        for index, part in enumerate(parts):
+            call = part.get("functionCall")
+            if call:
+                tool_deltas.append({
+                    "index": index,
+                    "id": f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {
+                        "name": call.get("name", ""),
+                        "arguments": json.dumps(call.get("args") or {}, separators=(",", ":")),
+                    },
+                })
+        if tool_deltas:
+            delta["tool_calls"] = tool_deltas
+        finish = candidate.get("finishReason")
+        prompt_tokens, completion_tokens = self._usage(data)
+        if not delta and not finish and not prompt_tokens and not completion_tokens:
+            return None
+        chunk: dict[str, Any] = {
+            "id": f"chatcmpl-google-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": self._finish_reason(finish) if finish else None,
+            }],
+        }
+        if prompt_tokens or completion_tokens:
+            chunk["usage"] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+        return "data: " + json.dumps(chunk, separators=(",", ":"))
 
     async def models(self) -> list[dict[str, Any]]:
-        t0 = time.time()
-        resp = await self._http.get(
-            self._url("models"),
-            headers=self._headers(),
-        )
-        latency_ms = (time.time() - t0) * 1000
-        self._record_rate_limits(dict(resp.headers))
-        self._check(resp)
-        self._record_request_metrics(success=True, latency_ms=latency_ms)
-        data = resp.json()
+        t0 = time.perf_counter()
+        status_code: int | None = None
+        try:
+            resp = await self._http.get(self._url("models"), headers=self._headers(), timeout=self.config.timeout_seconds)
+            status_code = resp.status_code
+            await self._record_rate_limits(dict(resp.headers))
+            self._check_status(resp)
+            data = resp.json()
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+            await self._record_attempt(reservation_id=None, success=False, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code, request_kind="model_discovery")
+            raise ProviderUnavailable(f"{self.name} unreachable: {exc}") from exc
+        except (ProviderUnavailable, ProviderRequestError):
+            await self._record_attempt(reservation_id=None, success=False, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code, request_kind="model_discovery")
+            raise
+        await self._record_attempt(reservation_id=None, success=True, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code, request_kind="model_discovery")
         return [
-            {"id": m["name"].removeprefix("models/"), "type": m.get("displayName", "")}
-            for m in data.get("models", [])
-            if "generateContent" in m.get("supportedGenerationMethods", [])
+            {"id": item["name"].removeprefix("models/"), "type": item.get("displayName", "")}
+            for item in data.get("models", [])
+            if "generateContent" in item.get("supportedGenerationMethods", [])
         ]
 
     async def complete(self, payload: dict[str, Any]) -> dict[str, Any]:
-        self._check_quota()
+        reservation_id = await self._reserve_quota(payload)
         model = payload.get("model", self.config.default_model)
-        gemini_payload = self._openai_to_gemini_payload(payload)
-        api_model = self._normalize_model(model)
-        t0 = time.time()
+        t0 = time.perf_counter()
+        status_code: int | None = None
         try:
             resp = await self._http.post(
-                self._url(f"{api_model}:generateContent"),
+                self._url(f"{self._normalize_model(model)}:generateContent"),
                 headers=self._headers(),
-                json=gemini_payload,
+                json=self._openai_to_gemini_payload(payload),
                 timeout=self.config.timeout_seconds,
             )
+            status_code = resp.status_code
+            await self._record_rate_limits(dict(resp.headers))
+            self._check_status(resp)
+            data = resp.json()
+            prompt_tokens, completion_tokens = self._usage(data)
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
-            self._record_request_metrics(success=False, latency_ms=(time.time() - t0) * 1000)
+            await self._record_attempt(reservation_id=reservation_id, success=False, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code)
             raise ProviderUnavailable(f"{self.name} unreachable: {exc}") from exc
-
-        latency_ms = (time.time() - t0) * 1000
-        self._record_rate_limits(dict(resp.headers))
-        self._check(resp)
-
-        data = resp.json()
-        prompt_tokens, completion_tokens = self._extract_gemini_usage(data)
-        self._record_request_metrics(
+        except (ProviderUnavailable, ProviderRequestError):
+            await self._record_attempt(reservation_id=reservation_id, success=False, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code)
+            raise
+        await self._record_attempt(
+            reservation_id=reservation_id,
             success=True,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            latency_ms=latency_ms,
+            latency_ms=(time.perf_counter() - t0) * 1000,
+            status_code=status_code,
         )
         return self._gemini_to_openai(data, model)
 
     async def stream(self, payload: dict[str, Any]) -> AsyncIterator[str]:
-        """Streaming via Gemini (not natively SSE-compatible; we buffer the result)."""
-        self._check_quota()
+        reservation_id = await self._reserve_quota(payload)
         model = payload.get("model", self.config.default_model)
-        gemini_payload = self._openai_to_gemini_payload(payload)
-        gemini_payload["generationConfig"] = gemini_payload.get("generationConfig", {})
-        gemini_payload["generationConfig"]["responseModalities"] = ["TEXT"]
-        api_model = self._normalize_model(model)
-        t0 = time.time()
+        t0 = time.perf_counter()
+        prompt_tokens = 0
+        completion_tokens = 0
+        status_code: int | None = None
         emitted = False
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-
+        recorded = False
         try:
-            headers = self._headers()
-            headers["Accept"] = "text/event-stream"
-            resp = await self._http.post(
-                self._url(f"{api_model}:streamGenerateContent?alt=sse"),
-                headers=headers,
-                json=gemini_payload,
+            async with self._http.stream(
+                "POST",
+                self._url(f"{self._normalize_model(model)}:streamGenerateContent?alt=sse"),
+                headers={**self._headers(), "Accept": "text/event-stream"},
+                json=self._openai_to_gemini_payload(payload),
                 timeout=self.config.stream_timeout_seconds,
+            ) as resp:
+                status_code = resp.status_code
+                await self._record_rate_limits(dict(resp.headers))
+                self._check_status(resp)
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw:
+                        continue
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    usage = self._usage(data)
+                    prompt_tokens = max(prompt_tokens, usage[0])
+                    completion_tokens = max(completion_tokens, usage[1])
+                    chunk = self._gemini_stream_chunk(data, model)
+                    if chunk:
+                        emitted = True
+                        yield chunk
+            yield "data: [DONE]"
+            await self._record_attempt(
+                reservation_id=reservation_id,
+                success=True,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                status_code=status_code,
             )
+            recorded = True
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
-            self._record_request_metrics(
-                success=False,
-                prompt_tokens=total_prompt_tokens,
-                completion_tokens=total_completion_tokens,
-                latency_ms=(time.time() - t0) * 1000,
-            )
+            await self._record_attempt(reservation_id=reservation_id, success=False, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code)
+            recorded = True
+            if emitted:
+                raise
             raise ProviderUnavailable(f"{self.name} unreachable during stream: {exc}") from exc
-
-        self._record_rate_limits(dict(resp.headers))
-        self._check(resp)
-
-        async for line in resp.aiter_lines():
-            if not emitted and line:
-                emitted = True
-            yield line
-
-        self._record_request_metrics(
-            success=True,
-            prompt_tokens=total_prompt_tokens,
-            completion_tokens=total_completion_tokens,
-            latency_ms=(time.time() - t0) * 1000,
-        )
+        except (ProviderUnavailable, ProviderRequestError):
+            await self._record_attempt(reservation_id=reservation_id, success=False, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code)
+            recorded = True
+            raise
+        finally:
+            if not recorded and self._metrics_store is not None:
+                await self._metrics_store.cancel_reservation(reservation_id)
