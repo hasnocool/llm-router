@@ -139,7 +139,9 @@ class GoogleAIProvider(Provider):
             declaration = {
                 "name": function.get("name"),
                 "description": function.get("description", ""),
-                "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+                "parameters": self._sanitize_schema(
+                    function.get("parameters") or {"type": "object", "properties": {}}
+                ),
             }
             if declaration["name"]:
                 function_declarations.append(declaration)
@@ -158,6 +160,57 @@ class GoogleAIProvider(Provider):
                     "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]}
                 }
         return gemini
+
+    @staticmethod
+    def _sanitize_schema(schema: Any) -> Any:
+        # Gemini's function declaration schema rejects standard JSON-Schema
+        # keywords that OpenAI-compatible clients commonly emit ($schema,
+        # additionalProperties, title, const, examples, ...). Keep only the
+        # subset Gemini's Schema type accepts, recursively.
+        allowed = {
+            "type",
+            "description",
+            "format",
+            "nullable",
+            "enum",
+            "default",
+            "example",
+            "minimum",
+            "maximum",
+            "minLength",
+            "maxLength",
+            "pattern",
+            "minItems",
+            "maxItems",
+            "minProperties",
+            "maxProperties",
+            "uniqueItems",
+            "items",
+            "prefixItems",
+            "properties",
+            "required",
+            "anyOf",
+            "oneOf",
+            "allOf",
+            "not",
+        }
+        if isinstance(schema, dict):
+            cleaned: dict[str, Any] = {}
+            for key, value in schema.items():
+                if key not in allowed or value is None:
+                    continue
+                if key == "properties":
+                    cleaned[key] = {
+                        name: GoogleAIProvider._sanitize_schema(sub)
+                        for name, sub in value.items()
+                        if isinstance(value, dict)
+                    }
+                else:
+                    cleaned[key] = GoogleAIProvider._sanitize_schema(value)
+            return cleaned
+        if isinstance(schema, list):
+            return [GoogleAIProvider._sanitize_schema(item) for item in schema]
+        return schema
 
     @staticmethod
     def _usage(data: dict[str, Any]) -> tuple[int, int]:
@@ -264,7 +317,7 @@ class GoogleAIProvider(Provider):
             resp = await self._http.get(self._url("models"), headers=self._headers(), timeout=self.config.timeout_seconds)
             status_code = resp.status_code
             await self._record_rate_limits(dict(resp.headers))
-            self._check_status(resp)
+            await self._check_status(resp)
             data = resp.json()
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
             await self._record_attempt(reservation_id=None, success=False, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code, request_kind="model_discovery")
@@ -293,7 +346,7 @@ class GoogleAIProvider(Provider):
             )
             status_code = resp.status_code
             await self._record_rate_limits(dict(resp.headers))
-            self._check_status(resp)
+            await self._check_status(resp)
             data = resp.json()
             prompt_tokens, completion_tokens = self._usage(data)
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
@@ -331,7 +384,7 @@ class GoogleAIProvider(Provider):
             ) as resp:
                 status_code = resp.status_code
                 await self._record_rate_limits(dict(resp.headers))
-                self._check_status(resp)
+                await self._check_status(resp)
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):
                         continue

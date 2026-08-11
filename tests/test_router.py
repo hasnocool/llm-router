@@ -350,6 +350,31 @@ class TestRoutingPool:
         full_ids = [m.id for m in full]
         assert "m1" in full_ids and "m2" in full_ids
 
+    async def test_asgi_streaming_does_not_crash_on_token_reset(self, monkeypatch):
+        import llm_router.main as main
+
+        class FakeRouter:
+            settings = make_settings()
+
+            async def stream(self, req):
+                yield 'data: {"id":"s","choices":[{"index":0,"delta":{"content":"hi"}}]}'
+                yield "data: [DONE]"
+
+        monkeypatch.setattr(main, "_router", FakeRouter())
+        monkeypatch.setattr(main, "_settings", FakeRouter.settings)
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            assert resp.status_code == 200
+            assert "data: [DONE]" in resp.text
+
     def test_routing_pool_rejects_unknown_provider(self, tmp_path):
         cfg = tmp_path / "config.toml"
         cfg.write_text(

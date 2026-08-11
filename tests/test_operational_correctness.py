@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 
 import httpx
@@ -89,6 +90,54 @@ def test_gemini_system_and_assistant_roles_are_preserved():
     )
     assert payload["systemInstruction"]["parts"][0]["text"] == "be concise"
     assert [item["role"] for item in payload["contents"]] == ["user", "model"]
+
+
+def test_gemini_schema_sanitizes_openai_tool_parameters():
+    provider = GoogleAIProvider(
+        "google_ai",
+        ProviderConfig("Google", "https://example.invalid", "gemini"),
+        httpx.AsyncClient(),
+    )
+    payload = provider._openai_to_gemini_payload(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read a file",
+                        "parameters": {
+                            "$schema": "https://json-schema.org/draft/2020-12/schema",
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "file path"},
+                                "opts": {
+                                    "type": "object",
+                                    "additionalProperties": {"type": "string"},
+                                    "properties": {"lev": {"type": "integer", "const": 2}},
+                                },
+                            },
+                            "required": ["path"],
+                            "additionalProperties": False,
+                            "const": 1,
+                            "title": "ignored",
+                        },
+                    },
+                }
+            ],
+        }
+    )
+    decl = payload["tools"][0]["functionDeclarations"][0]
+    params = decl["parameters"]
+    assert "$schema" not in json.dumps(params)
+    assert "const" not in json.dumps(params)
+    assert "additionalProperties" not in json.dumps(params)
+    assert "title" not in json.dumps(params)
+    assert params["type"] == "object"
+    assert params["required"] == ["path"]
+    assert params["properties"]["path"]["type"] == "string"
+    assert params["properties"]["opts"]["properties"]["lev"]["type"] == "integer"
 
 
 def test_gemini_stream_chunk_is_openai_compatible():

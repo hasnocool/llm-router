@@ -63,15 +63,13 @@ class ZeroCostModelRouter(ModelRouter):
 
         primary, primary_model = self.settings.resolve(req.model or "qwen3-8b")
 
-        # "auto" (or an empty model string) picks only currently eligible
-        # zero-cost providers in the routing pool, using each default model.
+        # "auto" (or an empty model string) picks the best-ranked eligible
+        # provider in the routing pool using its default model, with failover.
         if not req.model or req.model.lower() in {"auto", "best", "*"}:
             pool = self._routing_pool()
             scores = [
-                score
-                for score in self.route_scores()
-                if score.eligible
-                and score.provider in pool
+                score for score in self.route_scores()
+                if score.provider in pool
                 and self.settings.provider(score.provider).default_model
             ]
             names = [score.provider for score in scores]
@@ -124,6 +122,12 @@ class ZeroCostModelRouter(ModelRouter):
                 errors.append(f"{name}: {exc}")
                 self._mark_retryable_failure(name, exc)
                 continue
+            except ProviderRequestError as exc:
+                if len(order) == 1:
+                    raise
+                errors.append(f"{name}: {exc}")
+                self._mark_provider_failure(name, exc)
+                continue
             self._mark_provider_success(name, (time.perf_counter() - t0) * 1000)
             await self._enrich_status_with_metrics(name)
             return self._to_response(data, model, provider_name=name)
@@ -158,8 +162,12 @@ class ZeroCostModelRouter(ModelRouter):
                 errors.append(f"{name}: {exc}")
                 self._mark_retryable_failure(name, exc)
                 continue
-            except ProviderRequestError:
-                raise
+            except ProviderRequestError as exc:
+                if len(order) == 1:
+                    raise
+                errors.append(f"{name}: {exc}")
+                self._mark_provider_failure(name, exc)
+                continue
 
         raise ProviderUnavailable("all zero-cost providers failed: " + "; ".join(errors))
 

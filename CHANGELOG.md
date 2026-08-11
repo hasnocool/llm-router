@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Fixed streaming requests that aborted when a provider returned an error status mid-stream (e.g. Groq HTTP 413): the router now reads the error body safely and emits a clean SSE error instead of crashing the connection.
+- Treated HTTP 413 (payload too large) as retryable so zero-cost routing fails over to the next provider whose context window fits the request.
+- Sanitized Gemini function-declaration schemas so OpenAI-compatible clients' JSON-Schema keywords (`$schema`, `title`, `const`, `additionalProperties`, ...) no longer break tool calls.
+- Scoped forwarded-request headers to the request lifetime so streaming and non-streaming paths reset the context correctly.
 - Removed quota-burning 60-second provider model polling from daemon background work.
 - Made provider/matrix/metrics status endpoints passive and cache-backed.
 - Moved runtime SQLite/report I/O off the asyncio event loop through a serialized metrics worker.
@@ -23,3 +27,5 @@
 - Optional `ROUTER_API_KEY` protection for `/v1/*` endpoints.
 - Operational correctness regression suite.
 - Python 3.12 GitHub Actions CI with pytest, compile checks, Ruff critical checks, and required Pyright type checking.
+- Streaming failover coverage: an HTTP 413 from the primary provider now falls through to the next zero-cost route.
+- ASGI streaming regression coverage for router-owned header/context lifecycle.

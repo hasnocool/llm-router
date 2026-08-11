@@ -7,11 +7,11 @@
 #   "local-first" -> prefer the local llama.cpp provider before cloud routes.
 strategy = "zero-cost"
 
-# Only these providers participate in automatic/fallback routing and in the
-# /v1/models list (so OpenClaude only offers these). Explicit "provider:model"
-# requests still work for any configured provider.
+# Providers eligible for automatic/fallback routing and the /v1/models list.
+# Under strategy="zero-cost", "auto" picks the best-ranked healthy provider and
+# fails over through the rest. Explicit "provider:model" requests always work.
 [routing]
-providers = ["huggingface"]
+providers = ["groq", "huggingface", "google_ai", "cerebras", "nvidia"]
 
 # Seconds to wait before treating a non-streaming call as failed (per provider).
 timeout_seconds = 60.0
@@ -32,7 +32,7 @@ default_model = "granite-3.3-2b-instruct"
 [providers.cerebras]
 name = "Cerebras Inference"
 base_url = "https://api.cerebras.ai/v1"
-default_model = "llama-3.3-70b"
+default_model = "gpt-oss-120b"
 api_key_env = "CEREBRAS_API_KEY"
 timeout_seconds = 120.0
 stream_timeout_seconds = 240.0

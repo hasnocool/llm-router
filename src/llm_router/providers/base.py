@@ -15,9 +15,11 @@ from ..rate_limits import RateLimitParser, extract_usage_from_response, retry_af
 
 # HTTP statuses that indicate the provider is unavailable (retryable/failover).
 # 402 (payment required) is included so auto/fallback routing skips providers
-# whose billing/quota prevents them from serving. Anything else (400/401/403/
-# 404/422) is a client error and never triggers failover.
-RETRYABLE_STATUSES = {402, 429, 500, 502, 503, 504}
+# whose billing/quota prevents them from serving. 413 (payload too large) is
+# also retryable because context/payload limits are provider-specific: a prompt
+# rejected by one provider may fit another, so zero-cost routing fails over.
+# Anything else (400/401/403/404/422) is a client error and never triggers failover.
+RETRYABLE_STATUSES = {402, 413, 429, 500, 502, 503, 504}
 
 FORWARDED_REQUEST_HEADERS: ContextVar[dict[str, str]] = ContextVar(
     "forwarded_request_headers", default={}
@@ -115,7 +117,7 @@ class Provider:
     def _url(self, path: str) -> str:
         return f"{self.config.base_url}/{path.lstrip('/')}"
 
-    def _check_status(self, resp: httpx.Response) -> None:
+    async def _check_status(self, resp: httpx.Response) -> None:
         if resp.status_code in RETRYABLE_STATUSES:
             raise ProviderUnavailable(
                 f"{self.name} returned HTTP {resp.status_code}",
@@ -123,10 +125,15 @@ class Provider:
                 retry_after_until=retry_after_timestamp(resp.headers),
             )
         if resp.status_code >= 400:
+            try:
+                await resp.aread()
+                body = resp.text[:2000]
+            except (httpx.ResponseNotRead, httpx.DecodingError, UnicodeError):
+                body = ""
             raise ProviderRequestError(
                 f"{self.name} returned HTTP {resp.status_code}",
                 status_code=resp.status_code,
-                body=resp.text[:2000],
+                body=body,
             )
 
     async def _reserve_quota(self, payload: dict[str, Any]) -> str | None:
@@ -179,7 +186,7 @@ class Provider:
             )
             status_code = resp.status_code
             await self._record_rate_limits(dict(resp.headers))
-            self._check_status(resp)
+            await self._check_status(resp)
             data = resp.json()
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
             await self._record_attempt(
@@ -222,7 +229,7 @@ class Provider:
             )
             status_code = resp.status_code
             await self._record_rate_limits(dict(resp.headers))
-            self._check_status(resp)
+            await self._check_status(resp)
             data = resp.json()
             prompt_tokens, completion_tokens = extract_usage_from_response(data)
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
@@ -270,7 +277,7 @@ class Provider:
             ) as resp:
                 status_code = resp.status_code
                 await self._record_rate_limits(dict(resp.headers))
-                self._check_status(resp)
+                await self._check_status(resp)
                 async for line in resp.aiter_lines():
                     if line:
                         emitted = True

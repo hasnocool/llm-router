@@ -194,10 +194,10 @@ async def prometheus_metrics():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
-    token = set_forwarded_request_headers(dict(request.headers))
     router = get_router()
     if req.stream:
         async def event_source():
+            token = set_forwarded_request_headers(dict(request.headers))
             try:
                 async for line in router.stream(req):
                     yield line + "\n"
@@ -213,6 +213,7 @@ async def chat_completions(req: ChatRequest, request: Request):
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+    token = set_forwarded_request_headers(dict(request.headers))
     try:
         response = await router.complete(req)
         return JSONResponse(content=response.model_dump(exclude_none=True))

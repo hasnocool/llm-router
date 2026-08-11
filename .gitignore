@@ -7,4 +7,6 @@ dist/
 build/
 *.egg-info/
 metrics.db
+metrics.db-shm
+metrics.db-wal
 metrics_report.md
