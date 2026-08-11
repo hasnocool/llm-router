@@ -50,6 +50,42 @@ class MetricsConfig:
 
 
 @dataclass
+class LogsConfig:
+    """Logging configuration: console/file handlers plus the debugging event log."""
+
+    level: str = "INFO"
+    file_path: str | None = None
+    max_bytes: int = 10 * 1024 * 1024
+    backup_count: int = 5
+    log_message_bodies: bool = True
+    max_body_chars: int = 120_000
+
+
+@dataclass
+class ProviderPricing:
+    input_cost_per_1m_tokens: float = 0.0
+    output_cost_per_1m_tokens: float = 0.0
+
+
+@dataclass
+class AnalyticsConfig:
+    currency: str = "USD"
+    default_input_cost_per_1m_tokens: float = 0.0
+    default_output_cost_per_1m_tokens: float = 0.0
+    error_rate_warning_threshold: float = 0.05
+    error_rate_critical_threshold: float = 0.10
+    failover_rate_warning_threshold: float = 0.15
+    pricing: dict[str, ProviderPricing] = field(default_factory=dict)
+
+
+@dataclass
+class ClassifierConfig:
+    enabled: bool = True
+    fallback_enabled: bool = True
+    fallback_confidence_threshold: float = 0.65
+
+
+@dataclass
 class Settings:
     strategy: str = "cloud-first"
     timeout_seconds: float = 60.0
@@ -57,6 +93,9 @@ class Settings:
     models: dict[str, ModelRoute] = field(default_factory=dict)
     quotas: dict[str, QuotaConfig] = field(default_factory=dict)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
+    logs: LogsConfig = field(default_factory=LogsConfig)
+    analytics: AnalyticsConfig = field(default_factory=AnalyticsConfig)
+    classifier: ClassifierConfig = field(default_factory=ClassifierConfig)
     host: str = "0.0.0.0"
     port: int = 8000
     # Providers allowed to participate in automatic/fallback routing. Empty/None
@@ -84,6 +123,13 @@ class Settings:
         if route is not None:
             return route.provider, route.model
         return "huggingface", model
+
+
+def _env_bool(env: dict[str, str], name: str, default: bool) -> bool:
+    value = env.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def normalize_provider(name: str | None) -> str:
@@ -116,6 +162,9 @@ def load_settings(
             if value is not None
         }
         resolved_env = {**dotenv_env, **resolved_env}
+
+        for key, value in dotenv_env.items():
+            os.environ.setdefault(key, value)
 
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
@@ -161,6 +210,51 @@ def load_settings(
         ),
     )
 
+    logs_raw = raw.get("logs", {})
+    logs = LogsConfig(
+        level=resolved_env.get("LLM_ROUTER_LOG_LEVEL", logs_raw.get("level", "INFO")),
+        file_path=logs_raw.get("file_path"),
+        max_bytes=logs_raw.get("max_bytes", 10 * 1024 * 1024),
+        backup_count=logs_raw.get("backup_count", 5),
+        log_message_bodies=_env_bool(
+            resolved_env,
+            "LLM_ROUTER_LOG_MESSAGE_BODIES",
+            logs_raw.get("log_message_bodies", True),
+        ),
+        max_body_chars=logs_raw.get("max_body_chars", 120_000),
+    )
+
+    analytics_raw = raw.get("analytics", {})
+    pricing_raw = analytics_raw.get("pricing", {})
+    analytics_default_input = float(analytics_raw.get("default_input_cost_per_1m_tokens", 0.0))
+    analytics_default_output = float(analytics_raw.get("default_output_cost_per_1m_tokens", 0.0))
+    analytics = AnalyticsConfig(
+        currency=str(analytics_raw.get("currency", "USD")),
+        default_input_cost_per_1m_tokens=analytics_default_input,
+        default_output_cost_per_1m_tokens=analytics_default_output,
+        error_rate_warning_threshold=float(analytics_raw.get("error_rate_warning_threshold", 0.05)),
+        error_rate_critical_threshold=float(analytics_raw.get("error_rate_critical_threshold", 0.10)),
+        failover_rate_warning_threshold=float(analytics_raw.get("failover_rate_warning_threshold", 0.15)),
+        pricing={
+            provider: ProviderPricing(
+                input_cost_per_1m_tokens=float(
+                    price.get("input_cost_per_1m_tokens", analytics_default_input)
+                ),
+                output_cost_per_1m_tokens=float(
+                    price.get("output_cost_per_1m_tokens", analytics_default_output)
+                ),
+            )
+            for provider, price in pricing_raw.items()
+        },
+    )
+
+    classifier_raw = raw.get("classifier", {})
+    classifier = ClassifierConfig(
+        enabled=bool(classifier_raw.get("enabled", True)),
+        fallback_enabled=bool(classifier_raw.get("fallback_enabled", True)),
+        fallback_confidence_threshold=float(classifier_raw.get("fallback_confidence_threshold", 0.65)),
+    )
+
     routing_raw = raw.get("routing", {})
     routing_providers = []
     for name in routing_raw.get("providers", []):
@@ -179,6 +273,9 @@ def load_settings(
         models=models,
         quotas=quotas,
         metrics=metrics,
+        logs=logs,
+        analytics=analytics,
+        classifier=classifier,
         host=resolved_env.get("HOST", "0.0.0.0"),
         port=int(resolved_env.get("PORT", "8000")),
         routing_providers=routing_providers,

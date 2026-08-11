@@ -11,6 +11,7 @@
 <header>
   <h1>llm-router <span id="strategy" class="badge"></span></h1>
   <div class="controls">
+    <a class="navlink" href="/logs">Logs</a>
     <label class="toggle">
       <input type="checkbox" id="autorefresh" checked>
       Auto-refresh (5s)
@@ -76,6 +77,29 @@
 <section class="panel">
   <h2>Request kinds</h2>
   <div class="kind-grid"><div id="kind-chart"><canvas id="chart-kinds"></canvas></div></div>
+</section>
+
+<section class="panel">
+  <h2>Analytics</h2>
+  <div id="analytics-alerts" class="alert-list"></div>
+  <section class="cards compact" id="analytics-summary"></section>
+  <div class="chart-row">
+    <div class="chart-box"><h3>Estimated cost by provider</h3><canvas id="chart-cost"></canvas></div>
+    <div class="chart-box"><h3>Success rate by provider</h3><canvas id="chart-success"></canvas></div>
+  </div>
+  <div class="chart-row">
+    <div class="chart-box"><h3>Traffic over time</h3><canvas id="chart-activity"></canvas></div>
+    <div class="chart-box"><h3>Error levels</h3><canvas id="chart-errors"></canvas></div>
+  </div>
+  <table id="analytics-providers">
+    <thead>
+      <tr>
+        <th>Provider</th><th>Attempts</th><th>Success rate</th><th>Failover rate</th>
+        <th>Tokens</th><th>Estimated cost</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 </section>
 
 <section class="panel">

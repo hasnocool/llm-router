@@ -4,6 +4,12 @@ let charts = {};
 
 const fmt = (n) => n == null ? "N/A" : n.toLocaleString();
 const ms = (n) => n == null ? "-" : `${n.toFixed(n < 10 ? 2 : 1)}ms`;
+const pctText = (n) => n == null ? "N/A" : `${(n * 100).toFixed(n < 0.1 ? 1 : 0)}%`;
+const money = (n, currency = "USD") => n == null ? "N/A" : new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency,
+  maximumFractionDigits: 4,
+}).format(n);
 const pct = (used, remaining) => {
   if (used == null && remaining == null) return null;
   const total = (used || 0) + (remaining || 0);
@@ -47,6 +53,7 @@ function render() {
   renderMatrix();
   renderModels();
   renderKinds();
+  renderAnalytics();
   renderEvents();
 }
 
@@ -255,6 +262,101 @@ function renderKinds() {
       },
     },
   });
+}
+
+function renderAnalytics() {
+  const analytics = state.analytics || {};
+  const summary = analytics.summary || {};
+  const providers = analytics.providers || {};
+  const timeline = analytics.timeline || [];
+  const providerNames = Object.keys(providers);
+  const currency = summary.currency || "USD";
+
+  const cards = document.getElementById("analytics-summary");
+  cards.innerHTML = "";
+  const items = [
+    ["Attempts", fmt(summary.attempts), ""],
+    ["Success rate", pctText(summary.success_rate), summary.success_rate != null && summary.success_rate < 0.9 ? "warn" : "ok"],
+    ["Failover rate", pctText(summary.failover_rate), summary.failover_rate != null && summary.failover_rate > 0.15 ? "warn" : "ok"],
+    ["Estimated cost", money(summary.estimated_cost_usd, currency), ""],
+    ["Tokens", fmt(summary.total_tokens), ""],
+    ["Providers", fmt(summary.providers), ""],
+  ];
+  for (const [label, value, cls] of items) {
+    const card = el("div", "card " + cls);
+    card.appendChild(el("div", "label", label));
+    card.appendChild(el("div", "value money", String(value)));
+    cards.appendChild(card);
+  }
+
+  const alerts = document.getElementById("analytics-alerts");
+  alerts.innerHTML = "";
+  const list = analytics.alerts || [];
+  if (list.length === 0) {
+    alerts.appendChild(el("div", "alert-item", "No active analytics alerts"));
+  } else {
+    for (const alert of list) {
+      const item = el("div", `alert-item ${alert.severity || "warning"}`);
+      item.appendChild(el("div", null, `${alert.message || alert.metric || "alert"}`));
+      item.appendChild(el("div", "meta", `${alert.metric || "metric"} · ${alert.provider || "overall"} · threshold ${pctText(alert.threshold)} · observed ${pctText(alert.value)}`));
+      alerts.appendChild(item);
+    }
+  }
+
+  const rows = document.querySelector("#analytics-providers tbody");
+  rows.innerHTML = "";
+  const ordered = providerNames.sort((a, b) => (providers[b].estimated_cost_usd || 0) - (providers[a].estimated_cost_usd || 0));
+  for (const name of ordered) {
+    const p = providers[name];
+    const tr = el("tr");
+    tr.appendChild(el("td", null, name));
+    tr.appendChild(el("td", null, fmt(p.attempts)));
+    tr.appendChild(el("td", null, pctText(p.success_rate)));
+    tr.appendChild(el("td", null, pctText(p.failover_rate)));
+    tr.appendChild(el("td", null, fmt(p.total_tokens)));
+    tr.appendChild(el("td", "money", money(p.estimated_cost_usd, p.currency || currency)));
+    rows.appendChild(tr);
+  }
+
+  const costLabels = ordered;
+  makeChart("chart-cost", null, costLabels,
+    [{
+      label: `Estimated cost (${currency})`,
+      data: costLabels.map((name) => providers[name].estimated_cost_usd || 0),
+      backgroundColor: "#4c9aff",
+    }],
+    { scales: { y: { beginAtZero: true, ticks: { color: "#8b98a5" }, grid: { color: "#2d3646" } }, x: { ticks: { color: "#8b98a5" }, grid: { color: "#2d3646" } } } }
+  );
+
+  makeChart("chart-success", null, costLabels,
+    [{
+      label: "Success rate",
+      data: costLabels.map((name) => providers[name].success_rate == null ? 0 : providers[name].success_rate * 100),
+      backgroundColor: "#3fb950",
+    }],
+    { scales: { y: { beginAtZero: true, max: 100, ticks: { color: "#8b98a5" }, grid: { color: "#2d3646" } }, x: { ticks: { color: "#8b98a5" }, grid: { color: "#2d3646" } } } }
+  );
+
+  const days = timeline.map((row) => row.day);
+  makeChart("chart-activity", null, days,
+    [
+      { label: "Attempts", data: timeline.map((row) => row.attempts || 0), backgroundColor: "#4c9aff" },
+      { label: "Failures", data: timeline.map((row) => row.failures || 0), backgroundColor: "#f85149" },
+      { label: "Failovers", data: timeline.map((row) => row.failovers || 0), backgroundColor: "#d29922" },
+    ],
+    { scales: { y: { beginAtZero: true, ticks: { color: "#8b98a5" }, grid: { color: "#2d3646" } }, x: { ticks: { color: "#8b98a5" }, grid: { color: "#2d3646" } } } }
+  );
+
+  const errorLevels = summary.error_levels || {};
+  const errorLabels = Object.keys(errorLevels);
+  makeChart("chart-errors", null, errorLabels,
+    [{
+      label: "Events",
+      data: errorLabels.map((name) => errorLevels[name] || 0),
+      backgroundColor: errorLabels.map((name) => name === "error" ? "#f85149" : name === "warning" ? "#d29922" : "#4c9aff"),
+    }],
+    { scales: { y: { beginAtZero: true, ticks: { color: "#8b98a5" }, grid: { color: "#2d3646" } }, x: { ticks: { color: "#8b98a5" }, grid: { color: "#2d3646" } } } }
+  );
 }
 
 function renderEvents() {

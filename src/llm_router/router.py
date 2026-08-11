@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ import httpx
 
 from .async_metrics import AsyncMetricsStore
 from .config import Settings, normalize_provider
+from .log_events import APP_EVENT_BUFFER, attach_event_context, reset_event_context
 from .metrics_db import QuotaConfig
 from .metrics_report import MetricsReportGenerator
 from .providers import build_provider, set_metrics_store
@@ -25,6 +27,8 @@ from .providers.base import (
     classify_response_kind,
 )
 from .schemas import ChatMessage, ChatRequest, ChatResponse, ChatUsage, Choice, ModelInfo
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -85,6 +89,7 @@ class ModelRouter:
         retention_days = self.settings.metrics.retention_days
         report_interval = self.settings.metrics.report_interval_seconds
         self._bg_tasks.append(asyncio.create_task(self._cleanup_metrics_loop(retention_days)))
+        self._bg_tasks.append(asyncio.create_task(self._drain_event_log_loop()))
         if report_interval > 0:
             self._bg_tasks.append(asyncio.create_task(self._generate_report_loop(report_interval)))
         self._started = True
@@ -120,8 +125,83 @@ class ModelRouter:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                import logging
                 logging.getLogger(__name__).warning("Report generation failed: %s", exc)
+
+    async def _drain_event_log_loop(self) -> None:
+        """Flush buffered logging events (warnings, exceptions) into the event log."""
+        while True:
+            try:
+                await asyncio.sleep(1.0)
+                events = APP_EVENT_BUFFER.drain()
+                if not events:
+                    continue
+                for event in events:
+                    try:
+                        await self._record_app_event(
+                            level=event.get("level", "info"),
+                            source=event.get("source", "app"),
+                            message=event.get("message", ""),
+                            provider=event.get("provider"),
+                            model=event.get("model"),
+                            request_id=event.get("request_id", ""),
+                            details=event.get("details"),
+                        )
+                    except Exception:
+                        logging.getLogger(__name__).exception("failed to persist event log entry")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logging.getLogger(__name__).warning("event log drain failed: %s", exc)
+
+    async def _record_app_event(
+        self,
+        *,
+        level: str,
+        source: str,
+        message: str,
+        provider: str | None = None,
+        model: str | None = None,
+        request_id: str = "",
+        details: dict[str, object] | None = None,
+    ) -> None:
+        try:
+            await self._metrics_store.record_app_event(
+                level=level,
+                source=source,
+                message=message,
+                provider=provider,
+                model=model,
+                request_id=request_id,
+                details=details,
+            )
+        except Exception:
+            logging.getLogger(__name__).exception("app event recording failed")
+
+    async def _log_event(
+        self,
+        *,
+        level: str,
+        source: str,
+        message: str,
+        provider: str | None = None,
+        model: str | None = None,
+        request_id: str = "",
+        details: dict[str, object] | None = None,
+    ) -> None:
+        # Emit through the standard logging pipeline so the record reaches the
+        # console/file handlers and is buffered into the dashboard event log.
+        token = attach_event_context(
+            provider=provider, model=model, request_id=request_id
+        )
+        record_fn = getattr(logging, level.lower(), None)
+        try:
+            if callable(record_fn):
+                extra = {"source": source}
+                if details:
+                    extra["details"] = details
+                record_fn("%s", message, extra=extra)
+        finally:
+            reset_event_context(token)
 
     async def _enrich_status_with_metrics(self, name: str) -> None:
         today, quota_remaining, rate_limits = await asyncio.gather(
@@ -279,6 +359,7 @@ class ModelRouter:
         completion_tokens: int = 0,
         latency_ms: float = 0.0,
         status_code: int | None = None,
+        request_id: str = "",
     ) -> None:
         try:
             await self._metrics_store.record_router_event(
@@ -294,10 +375,72 @@ class ModelRouter:
                 completion_tokens=completion_tokens,
                 latency_ms=latency_ms,
                 status_code=status_code,
+                request_id=request_id,
             )
         except Exception:
-            import logging
             logging.getLogger(__name__).exception("router event recording failed")
+
+    @staticmethod
+    def _json_body(value: object, max_chars: int = 4_000) -> str:
+        try:
+            raw = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            raw = str(value)
+        if len(raw) > max_chars:
+            raw = raw[:max_chars] + '..."(truncated)'
+        return raw
+
+    def _message_log_request(self, req: ChatRequest) -> dict[str, Any]:
+        return {"model": req.model, "messages": [m.model_dump(exclude_none=True) for m in req.messages]}
+
+    async def _record_message_log(
+        self,
+        *,
+        request_id: str,
+        req: ChatRequest,
+        model: str,
+        stream: bool,
+        explicit: bool,
+        success: bool,
+        request_kind: str,
+        response_kind: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: float = 0.0,
+        status_code: int | None = None,
+        response: dict[str, Any] | None = None,
+        error: Exception | None = None,
+        provider: str | None = None,
+    ) -> None:
+        if not getattr(self.settings, "logs", None) or not self.settings.logs.log_message_bodies:
+            return
+        max_chars = self.settings.logs.max_body_chars
+        error_json = ""
+        try:
+            if isinstance(error, ProviderRequestError) and error.body:
+                error_json = error.body[:max_chars]
+        except AttributeError:
+            pass
+        try:
+            await self._metrics_store.record_message_log(
+                request_id=request_id,
+                provider=provider,
+                model=model,
+                stream=stream,
+                explicit=explicit,
+                success=success,
+                request_kind=request_kind,
+                response_kind=response_kind,
+                prompt_tokens=max(0, prompt_tokens),
+                completion_tokens=max(0, completion_tokens),
+                latency_ms=max(0.0, latency_ms),
+                status_code=status_code,
+                request_json=self._json_body(self._message_log_request(req), max_chars),
+                response_json=self._json_body(response or {}, max_chars) if response else "",
+                error_json=error_json,
+            )
+        except Exception:
+            logging.getLogger(__name__).exception("message log recording failed")
 
     def _order(self, req: ChatRequest) -> list[tuple[str, str]]:
         local_first = req.local_first if req.local_first is not None else self.settings.strategy == "local-first"
@@ -367,12 +510,21 @@ class ModelRouter:
         return payload
 
     async def complete(self, req: ChatRequest) -> ChatResponse:
+        request_id = uuid.uuid4().hex[:16]
         errors: list[str] = []
         order = self._order(req)
         if not order:
             raise ProviderUnavailable("no providers configured")
         request_kind = classify_request_kind({"tools": req.tools, "tool_choice": req.tool_choice})
         explicit = self._is_explicit(req)
+        await self._log_event(
+            level="info",
+            source="router",
+            message=f"chat request: model={req.model!r} kind={request_kind} explicit={explicit}",
+            model=req.model,
+            request_id=request_id,
+            details={"provider_count": len(order)},
+        )
         for idx, (name, model) in enumerate(order):
             provider = self.providers[name]
             t0 = time.perf_counter()
@@ -380,10 +532,27 @@ class ModelRouter:
                 data = await provider.complete(self._payload(req, model))
             except QuotaExceededError as exc:
                 self._mark_provider_failure(name, exc)
+                await self._record_message_log(
+                    request_id=request_id, req=req, model=model, stream=False, explicit=explicit,
+                    success=False, request_kind=request_kind, error=exc, provider=name,
+                    status_code=429, latency_ms=(time.perf_counter() - t0) * 1000,
+                )
                 raise ProviderRequestError(str(exc), status_code=429) from exc
             except ProviderUnavailable as exc:
                 self._mark_provider_failure(name, exc)
                 errors.append(f"{name}: {exc}")
+                await self._log_event(
+                    level="warning",
+                    source="router",
+                    message=f"provider {name} unavailable: {exc}",
+                    provider=name, model=model, request_id=request_id,
+                    details={"status_code": exc.status_code},
+                )
+                await self._record_message_log(
+                    request_id=request_id, req=req, model=model, stream=False, explicit=explicit,
+                    success=False, request_kind=request_kind, error=exc, provider=name,
+                    status_code=exc.status_code, latency_ms=(time.perf_counter() - t0) * 1000,
+                )
                 continue
             latency_ms = (time.perf_counter() - t0) * 1000
             self._mark_provider_success(name, latency_ms)
@@ -403,6 +572,21 @@ class ModelRouter:
                 completion_tokens=int(usage.get("completion_tokens", 0) or 0),
                 latency_ms=latency_ms,
                 status_code=200,
+                request_id=request_id,
+            )
+            await self._log_event(
+                level="info",
+                source="router",
+                message=f"provider {name} served {model} in {latency_ms:.0f}ms",
+                provider=name, model=model, request_id=request_id,
+            )
+            await self._record_message_log(
+                request_id=request_id, req=req, model=model, stream=False, explicit=explicit,
+                success=True, request_kind=request_kind,
+                response_kind=classify_response_kind(data),
+                prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+                latency_ms=latency_ms, status_code=200, response=data, provider=name,
             )
             return self._to_response(data, model, provider_name=name)
         await self._record_router_event(
@@ -414,6 +598,15 @@ class ModelRouter:
             success=False,
             request_kind=request_kind,
             status_code=None,
+            request_id=request_id,
+        )
+        await self._log_event(
+            level="error",
+            source="router",
+            message="all providers failed: " + "; ".join(errors),
+            model=req.model,
+            request_id=request_id,
+            details={"errors": errors},
         )
         raise ProviderUnavailable("all providers failed: " + "; ".join(errors))
 
@@ -446,12 +639,21 @@ class ModelRouter:
         )
 
     async def stream(self, req: ChatRequest) -> AsyncIterator[str]:
+        request_id = uuid.uuid4().hex[:16]
         errors: list[str] = []
         order = self._order(req)
         if not order:
             raise ProviderUnavailable("no providers configured")
         request_kind = classify_request_kind({"tools": req.tools, "tool_choice": req.tool_choice})
         explicit = self._is_explicit(req)
+        await self._log_event(
+            level="info",
+            source="router",
+            message=f"stream request: model={req.model!r} kind={request_kind} explicit={explicit}",
+            model=req.model,
+            request_id=request_id,
+            details={"provider_count": len(order)},
+        )
         for idx, (name, model) in enumerate(order):
             provider = self.providers[name]
             t0 = time.perf_counter()
@@ -475,16 +677,46 @@ class ModelRouter:
                     response_kind="tool_call" if tool_response else "chat",
                     latency_ms=latency_ms,
                     status_code=200,
+                    request_id=request_id,
+                )
+                await self._log_event(
+                    level="info",
+                    source="router",
+                    message=f"provider {name} streamed {model} in {latency_ms:.0f}ms",
+                    provider=name, model=model, request_id=request_id,
+                )
+                await self._record_message_log(
+                    request_id=request_id, req=req, model=model, stream=True, explicit=explicit,
+                    success=True, request_kind=request_kind,
+                    response_kind="tool_call" if tool_response else "chat",
+                    latency_ms=latency_ms, status_code=200, provider=name,
                 )
                 return
             except QuotaExceededError as exc:
                 self._mark_provider_failure(name, exc)
+                await self._record_message_log(
+                    request_id=request_id, req=req, model=model, stream=True, explicit=explicit,
+                    success=False, request_kind=request_kind, error=exc, provider=name,
+                    status_code=429, latency_ms=(time.perf_counter() - t0) * 1000,
+                )
                 raise ProviderRequestError(str(exc), status_code=429) from exc
             except ProviderRequestError:
                 raise
             except ProviderUnavailable as exc:
                 self._mark_provider_failure(name, exc)
                 errors.append(f"{name}: {exc}")
+                await self._log_event(
+                    level="warning",
+                    source="router",
+                    message=f"provider {name} stream unavailable: {exc}",
+                    provider=name, model=model, request_id=request_id,
+                    details={"status_code": exc.status_code},
+                )
+                await self._record_message_log(
+                    request_id=request_id, req=req, model=model, stream=True, explicit=explicit,
+                    success=False, request_kind=request_kind, error=exc, provider=name,
+                    status_code=exc.status_code, latency_ms=(time.perf_counter() - t0) * 1000,
+                )
                 if idx < len(order) - 1:
                     continue
                 await self._record_router_event(
@@ -496,6 +728,7 @@ class ModelRouter:
                     success=False,
                     request_kind=request_kind,
                     status_code=exc.status_code,
+                    request_id=request_id,
                 )
                 raise ProviderUnavailable("all providers failed: " + "; ".join(errors)) from exc
 
@@ -571,6 +804,222 @@ class ModelRouter:
             )
         return out
 
+    async def get_logs_data(
+        self,
+        days: int = 1,
+        limit: int = 200,
+        *,
+        level: str | None = None,
+        provider: str | None = None,
+        request_id: str | None = None,
+        messages_only: bool = False,
+        events_only: bool = False,
+    ) -> dict[str, Any]:
+        since = time.time() - max(0, days) * 86400
+        events: list[dict[str, Any]] = []
+        messages: list[dict[str, Any]] = []
+        if not messages_only:
+            levels = ("error",) if level and level == "error" else ()
+            events = await self._metrics_store.get_app_events(
+                limit,
+                level=None if level in {None, "", "all", "error"} else level,
+                levels=levels,
+                provider=provider,
+                request_id=request_id,
+                since=since,
+            )
+        if not events_only:
+            messages = await self._metrics_store.get_message_logs(
+                limit,
+                provider=provider,
+                request_id=request_id,
+                since=since,
+            )
+        return {
+            "generated_at": time.time(),
+            "events": events,
+            "messages": messages,
+            "log_level": level,
+            "provider": provider,
+        }
+
+    def _pricing_for_provider(self, provider: str | None) -> tuple[float, float]:
+        analytics = self.settings.analytics
+        if not provider:
+            return analytics.default_input_cost_per_1m_tokens, analytics.default_output_cost_per_1m_tokens
+        pricing = analytics.pricing.get(provider)
+        if pricing is None:
+            return analytics.default_input_cost_per_1m_tokens, analytics.default_output_cost_per_1m_tokens
+        return pricing.input_cost_per_1m_tokens, pricing.output_cost_per_1m_tokens
+
+    @staticmethod
+    def _estimate_cost(prompt_tokens: int, completion_tokens: int, input_rate: float, output_rate: float) -> float:
+        return (max(0, prompt_tokens) / 1_000_000.0) * max(0.0, input_rate) + (
+            max(0, completion_tokens) / 1_000_000.0
+        ) * max(0.0, output_rate)
+
+    async def get_analytics_data(self, days: int = 30) -> dict[str, Any]:
+        provider_attempts, router_attempts, app_breakdown, timeline = await asyncio.gather(
+            self._metrics_store.get_provider_attempt_metrics(days),
+            self._metrics_store.get_router_attempt_metrics(days),
+            self._metrics_store.get_app_event_breakdown(days),
+            self._metrics_store.get_request_timeline(days),
+        )
+
+        provider_rows = {row.get("provider_name") or "": row for row in provider_attempts}
+        router_rows = {row.get("provider_name") or "": row for row in router_attempts}
+        provider_names = sorted(
+            {name for name in self.providers} | {name for name in provider_rows if name} | {name for name in router_rows if name}
+        )
+
+        providers: dict[str, Any] = {}
+        alerts: list[dict[str, Any]] = []
+        total_attempts = 0
+        total_successes = 0
+        total_failures = 0
+        total_failovers = 0
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        total_tokens = 0
+        total_estimated_cost = 0.0
+
+        analytics = self.settings.analytics
+
+        for name in provider_names:
+            attempt = provider_rows.get(name, {})
+            route = router_rows.get(name, {})
+            attempts = int(attempt.get("attempts") or 0)
+            successes = int(attempt.get("successes") or 0)
+            failures = int(attempt.get("failures") or max(0, attempts - successes))
+            failovers = int(route.get("failovers") or 0)
+            prompt_tokens = int(attempt.get("prompt_tokens") or 0)
+            completion_tokens = int(attempt.get("completion_tokens") or 0)
+            summed_tokens = int(attempt.get("total_tokens") or 0)
+            avg_latency_ms = float(attempt.get("avg_latency_ms") or 0.0)
+            streams = int(route.get("streams") or 0)
+            explicit_requests = int(route.get("explicit_requests") or 0)
+            route_requests = int(route.get("requests") or 0)
+            input_rate, output_rate = self._pricing_for_provider(name)
+            estimated_cost = self._estimate_cost(prompt_tokens, completion_tokens, input_rate, output_rate)
+            success_rate = (successes / attempts) if attempts else None
+            failure_rate = (failures / attempts) if attempts else None
+            failover_rate = (failovers / route_requests) if route_requests else None
+
+            total_attempts += attempts
+            total_successes += successes
+            total_failures += failures
+            total_failovers += failovers
+            total_prompt_tokens += prompt_tokens
+            total_completion_tokens += completion_tokens
+            total_tokens += summed_tokens
+            total_estimated_cost += estimated_cost
+
+            providers[name] = {
+                "name": name,
+                "attempts": attempts,
+                "successes": successes,
+                "failures": failures,
+                "success_rate": success_rate,
+                "failure_rate": failure_rate,
+                "route_requests": route_requests,
+                "failovers": failovers,
+                "failover_rate": failover_rate,
+                "streams": streams,
+                "explicit_requests": explicit_requests,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": summed_tokens,
+                "avg_latency_ms": avg_latency_ms,
+                "estimated_cost_usd": estimated_cost,
+                "currency": analytics.currency,
+            }
+
+            if attempts >= 5 and failure_rate is not None and failure_rate >= analytics.error_rate_critical_threshold:
+                alerts.append({
+                    "severity": "critical",
+                    "metric": "provider_failure_rate",
+                    "provider": name,
+                    "value": failure_rate,
+                    "threshold": analytics.error_rate_critical_threshold,
+                    "message": f"{name} failure rate is {failure_rate:.0%}",
+                })
+            elif attempts >= 5 and failure_rate is not None and failure_rate >= analytics.error_rate_warning_threshold:
+                alerts.append({
+                    "severity": "warning",
+                    "metric": "provider_failure_rate",
+                    "provider": name,
+                    "value": failure_rate,
+                    "threshold": analytics.error_rate_warning_threshold,
+                    "message": f"{name} failure rate is {failure_rate:.0%}",
+                })
+
+            if route_requests >= 5 and failover_rate is not None and failover_rate >= analytics.failover_rate_warning_threshold:
+                alerts.append({
+                    "severity": "warning",
+                    "metric": "provider_failover_rate",
+                    "provider": name,
+                    "value": failover_rate,
+                    "threshold": analytics.failover_rate_warning_threshold,
+                    "message": f"{name} failover rate is {failover_rate:.0%}",
+                })
+
+        overall_failover_rate = (total_failovers / max(1, sum(int(row.get("requests") or 0) for row in router_attempts)))
+        overall_success_rate = (total_successes / total_attempts) if total_attempts else None
+        overall_failure_rate = (total_failures / total_attempts) if total_attempts else None
+        error_levels = app_breakdown.get("levels", {})
+
+        if overall_failure_rate is not None:
+            if overall_failure_rate >= analytics.error_rate_critical_threshold:
+                alerts.append({
+                    "severity": "critical",
+                    "metric": "overall_failure_rate",
+                    "value": overall_failure_rate,
+                    "threshold": analytics.error_rate_critical_threshold,
+                    "message": f"Overall failure rate is {overall_failure_rate:.0%}",
+                })
+            elif overall_failure_rate >= analytics.error_rate_warning_threshold:
+                alerts.append({
+                    "severity": "warning",
+                    "metric": "overall_failure_rate",
+                    "value": overall_failure_rate,
+                    "threshold": analytics.error_rate_warning_threshold,
+                    "message": f"Overall failure rate is {overall_failure_rate:.0%}",
+                })
+
+        if overall_failover_rate >= analytics.failover_rate_warning_threshold:
+            alerts.append({
+                "severity": "warning",
+                "metric": "overall_failover_rate",
+                "value": overall_failover_rate,
+                "threshold": analytics.failover_rate_warning_threshold,
+                "message": f"Overall failover rate is {overall_failover_rate:.0%}",
+            })
+
+        return {
+            "generated_at": time.time(),
+            "days": days,
+            "summary": {
+                "providers": len(provider_names),
+                "attempts": total_attempts,
+                "successes": total_successes,
+                "failures": total_failures,
+                "success_rate": overall_success_rate,
+                "failure_rate": overall_failure_rate,
+                "failovers": total_failovers,
+                "failover_rate": overall_failover_rate,
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_tokens,
+                "estimated_cost_usd": total_estimated_cost,
+                "currency": analytics.currency,
+                "error_levels": error_levels,
+                "event_sources": app_breakdown.get("sources", {}),
+            },
+            "timeline": timeline,
+            "providers": providers,
+            "alerts": alerts,
+        }
+
     async def get_provider_metrics(self, provider: str, days: int = 7) -> dict[str, Any]:
         daily, today, quota_remaining, rate_limits = await asyncio.gather(
             self._metrics_store.get_daily_metrics(provider, days),
@@ -640,6 +1089,7 @@ class ModelRouter:
         )
         kind_breakdown = await self._metrics_store.get_kind_breakdown(days)
         recent_events = await self._metrics_store.get_recent_router_events(events)
+        analytics = await self.get_analytics_data(days=max(1, days))
         models = await self.list_models()
 
         providers: dict[str, Any] = {}
@@ -731,4 +1181,5 @@ class ModelRouter:
             "matrix": matrix,
             "models": [{"id": item.id, "owned_by": item.owned_by} for item in models],
             "recent_events": recent_events,
+            "analytics": analytics,
         }

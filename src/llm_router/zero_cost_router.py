@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from typing import AsyncIterator
 
 import httpx
@@ -17,6 +18,7 @@ from .providers.base import (
 )
 from .router import ModelRouter, ProviderStatus
 from .routing_score import RouteScore, ZeroCostPolicy, route_sort_key, runtime_route_score
+from .task_classifier import TaskProfile, classify_task, refine_task_profile_with_model
 from .schemas import ChatRequest, ChatResponse
 
 
@@ -72,12 +74,14 @@ class ZeroCostModelRouter(ModelRouter):
         # "auto" (or an empty model string) picks the best-ranked eligible
         # provider in the routing pool using its default model, with failover.
         if not req.model or req.model.lower() in {"auto", "best", "*"}:
+            profile = classify_task(req.model_dump()) if self.settings.classifier.enabled else TaskProfile(kind="general", confidence=1.0)
             pool = self._routing_pool()
             scores = [
                 score for score in self.route_scores()
                 if score.provider in pool
                 and self.settings.provider(score.provider).default_model
             ]
+            scores = self._apply_task_profile(scores, profile)
             names = [score.provider for score in scores]
             if req.local_first is True and "local" in names:
                 names.remove("local")
@@ -89,7 +93,8 @@ class ZeroCostModelRouter(ModelRouter):
                 for name in names
             ]
 
-        scores = [score for score in self.route_scores(primary=primary) if score.eligible]
+        profile = classify_task(req.model_dump()) if self.settings.classifier.enabled else TaskProfile(kind="general", confidence=1.0)
+        scores = self._apply_task_profile([score for score in self.route_scores(primary=primary) if score.eligible], profile)
         names = [score.provider for score in scores]
 
         if req.local_first is True and "local" in names:
@@ -106,17 +111,109 @@ class ZeroCostModelRouter(ModelRouter):
             for name in names
         ]
 
+    async def _task_profile(self, req: ChatRequest) -> TaskProfile:
+        base = classify_task(req.model_dump()) if self.settings.classifier.enabled else TaskProfile(kind="general", confidence=1.0)
+        return await refine_task_profile_with_model(self.settings, req.model_dump(), base)
+
+    async def _order_for_request(self, req: ChatRequest) -> list[tuple[str, str]]:
+        if self.settings.strategy != "zero-cost":
+            return self._order(req)
+        profile = await self._task_profile(req)
+        return self._order_with_profile(req, profile)
+
+    def _order_with_profile(self, req: ChatRequest, profile: TaskProfile) -> list[tuple[str, str]]:
+        if self.settings.strategy != "zero-cost":
+            return super()._order(req)
+
+        colon_provider = req.model.partition(":")[0] if ":" in req.model else None
+        explicit = req.provider or (
+            colon_provider if normalize_provider(colon_provider) in self.providers else None
+        )
+        if explicit:
+            return super()._order(req)
+
+        primary, primary_model = self.settings.resolve(req.model or "qwen3-8b")
+        if not req.model or req.model.lower() in {"auto", "best", "*"}:
+            pool = self._routing_pool()
+            scores = [
+                score for score in self.route_scores()
+                if score.provider in pool
+                and self.settings.provider(score.provider).default_model
+            ]
+            scores = self._apply_task_profile(scores, profile)
+            names = [score.provider for score in scores]
+            if req.local_first is True and "local" in names:
+                names.remove("local")
+                names.insert(0, "local")
+            elif req.local_first is False and "local" in names:
+                names = [name for name in names if name != "local"] + ["local"]
+            return [(name, self.settings.provider(name).default_model) for name in names]
+
+        scores = [score for score in self.route_scores(primary=primary) if score.eligible]
+        scores = self._apply_task_profile(scores, profile)
+        names = [score.provider for score in scores]
+        if req.local_first is True and "local" in names:
+            names.remove("local")
+            names.insert(0, "local")
+        elif req.local_first is False and "local" in names:
+            names = [name for name in names if name != "local"] + ["local"]
+        return [
+            (
+                name,
+                primary_model if name == primary else self.settings.provider(name).default_model,
+            )
+            for name in names
+        ]
+
+    def _apply_task_profile(self, scores: list[RouteScore], profile: TaskProfile) -> list[RouteScore]:
+        if not scores:
+            return scores
+        weighted: list[tuple[float, RouteScore]] = []
+        for score in scores:
+            bonus = self._task_bonus(score.provider, profile)
+            weighted.append((score.dynamic_score + bonus, score))
+        weighted.sort(key=lambda item: (-item[0], item[1].provider))
+        return [item[1] for item in weighted]
+
+    def _task_bonus(self, provider: str, profile: TaskProfile) -> float:
+        entry = get_provider_matrix_entry(provider)
+        bonus = 0.0
+        if not entry:
+            return bonus
+        if profile.coding_heavy and provider in {"huggingface", "openrouter", "groq"}:
+            bonus += 4.0
+        if profile.needs_tools and entry.tool_calling in {True, "yes", "model-dependent"}:
+            bonus += 4.0
+        if profile.needs_json and entry.openai_compatible == "yes":
+            bonus += 2.5
+        if profile.needs_vision and entry.vision in {True, "yes", "model-dependent"}:
+            bonus += 3.0
+        if profile.needs_long_context and entry.context_window:
+            bonus += 2.0
+        if profile.speed_sensitive and provider in {"groq", "openrouter"}:
+            bonus += 2.0
+        return bonus
+
     async def complete(self, req: ChatRequest) -> ChatResponse:
         if self.settings.strategy != "zero-cost":
             return await super().complete(req)
 
         errors: list[str] = []
-        order = self._order(req)
+        order = await self._order_for_request(req)
         if not order:
             raise ProviderUnavailable("no zero-cost providers are currently eligible")
 
         request_kind = classify_request_kind({"tools": req.tools, "tool_choice": req.tool_choice})
         explicit = self._is_explicit(req)
+        request_id = uuid.uuid4().hex[:16]
+        await self._log_event(
+            level="info",
+            source="router",
+            message=f"zero-cost chat request: model={req.model!r} kind={request_kind} explicit={explicit}",
+            model=req.model,
+            request_id=request_id,
+            details={"provider_count": len(order)},
+        )
         for idx, (name, model) in enumerate(order):
             provider = self.providers[name]
             t0 = time.perf_counter()
@@ -125,16 +222,51 @@ class ZeroCostModelRouter(ModelRouter):
             except QuotaExceededError as exc:
                 errors.append(f"{name}: {exc}")
                 self._mark_quota_exhausted(name)
+                await self._record_message_log(
+                    request_id=request_id, req=req, model=model, stream=False, explicit=explicit,
+                    success=False, request_kind=request_kind, error=exc, provider=name,
+                    status_code=429, latency_ms=(time.perf_counter() - t0) * 1000,
+                )
+                await self._log_event(
+                    level="warning",
+                    source="router",
+                    message=f"provider {name} quota exhausted: {exc}",
+                    provider=name, model=model, request_id=request_id,
+                )
                 continue
             except ProviderUnavailable as exc:
                 errors.append(f"{name}: {exc}")
                 self._mark_retryable_failure(name, exc)
+                await self._record_message_log(
+                    request_id=request_id, req=req, model=model, stream=False, explicit=explicit,
+                    success=False, request_kind=request_kind, error=exc, provider=name,
+                    status_code=exc.status_code, latency_ms=(time.perf_counter() - t0) * 1000,
+                )
+                await self._log_event(
+                    level="warning",
+                    source="router",
+                    message=f"provider {name} unavailable: {exc}",
+                    provider=name, model=model, request_id=request_id,
+                    details={"status_code": exc.status_code},
+                )
                 continue
             except ProviderRequestError as exc:
                 if len(order) == 1:
                     raise
                 errors.append(f"{name}: {exc}")
                 self._mark_provider_failure(name, exc)
+                await self._record_message_log(
+                    request_id=request_id, req=req, model=model, stream=False, explicit=explicit,
+                    success=False, request_kind=request_kind, error=exc, provider=name,
+                    status_code=exc.status_code, latency_ms=(time.perf_counter() - t0) * 1000,
+                )
+                await self._log_event(
+                    level="error",
+                    source="router",
+                    message=f"provider {name} request failed: {exc}",
+                    provider=name, model=model, request_id=request_id,
+                    details={"status_code": exc.status_code},
+                )
                 continue
             latency_ms = (time.perf_counter() - t0) * 1000
             self._mark_provider_success(name, latency_ms)
@@ -154,6 +286,21 @@ class ZeroCostModelRouter(ModelRouter):
                 completion_tokens=int(usage.get("completion_tokens", 0) or 0),
                 latency_ms=latency_ms,
                 status_code=200,
+                request_id=request_id,
+            )
+            await self._log_event(
+                level="info",
+                source="router",
+                message=f"provider {name} served {model} in {latency_ms:.0f}ms",
+                provider=name, model=model, request_id=request_id,
+            )
+            await self._record_message_log(
+                request_id=request_id, req=req, model=model, stream=False, explicit=explicit,
+                success=True, request_kind=request_kind,
+                response_kind=classify_response_kind(data),
+                prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+                latency_ms=latency_ms, status_code=200, response=data, provider=name,
             )
             return self._to_response(data, model, provider_name=name)
 
@@ -166,6 +313,15 @@ class ZeroCostModelRouter(ModelRouter):
             success=False,
             request_kind=request_kind,
             status_code=None,
+            request_id=request_id,
+        )
+        await self._log_event(
+            level="error",
+            source="router",
+            message="all zero-cost providers failed: " + "; ".join(errors),
+            model=req.model,
+            request_id=request_id,
+            details={"errors": errors},
         )
         raise ProviderUnavailable("all zero-cost providers failed: " + "; ".join(errors))
 
@@ -176,12 +332,21 @@ class ZeroCostModelRouter(ModelRouter):
             return
 
         errors: list[str] = []
-        order = self._order(req)
+        order = await self._order_for_request(req)
         if not order:
             raise ProviderUnavailable("no zero-cost providers are currently eligible")
 
         request_kind = classify_request_kind({"tools": req.tools, "tool_choice": req.tool_choice})
         explicit = self._is_explicit(req)
+        request_id = uuid.uuid4().hex[:16]
+        await self._log_event(
+            level="info",
+            source="router",
+            message=f"zero-cost stream request: model={req.model!r} kind={request_kind} explicit={explicit}",
+            model=req.model,
+            request_id=request_id,
+            details={"provider_count": len(order)},
+        )
         for idx, (name, model) in enumerate(order):
             provider = self.providers[name]
             t0 = time.perf_counter()
@@ -205,21 +370,69 @@ class ZeroCostModelRouter(ModelRouter):
                     response_kind="tool_call" if tool_response else "chat",
                     latency_ms=latency_ms,
                     status_code=200,
+                    request_id=request_id,
+                )
+                await self._log_event(
+                    level="info",
+                    source="router",
+                    message=f"provider {name} streamed {model} in {latency_ms:.0f}ms",
+                    provider=name, model=model, request_id=request_id,
+                )
+                await self._record_message_log(
+                    request_id=request_id, req=req, model=model, stream=True, explicit=explicit,
+                    success=True, request_kind=request_kind,
+                    response_kind="tool_call" if tool_response else "chat",
+                    latency_ms=latency_ms, status_code=200, provider=name,
                 )
                 return
             except QuotaExceededError as exc:
                 errors.append(f"{name}: {exc}")
                 self._mark_quota_exhausted(name)
+                await self._record_message_log(
+                    request_id=request_id, req=req, model=model, stream=True, explicit=explicit,
+                    success=False, request_kind=request_kind, error=exc, provider=name,
+                    status_code=429, latency_ms=(time.perf_counter() - t0) * 1000,
+                )
+                await self._log_event(
+                    level="warning",
+                    source="router",
+                    message=f"provider {name} quota exhausted: {exc}",
+                    provider=name, model=model, request_id=request_id,
+                )
                 continue
             except ProviderUnavailable as exc:
                 errors.append(f"{name}: {exc}")
                 self._mark_retryable_failure(name, exc)
+                await self._record_message_log(
+                    request_id=request_id, req=req, model=model, stream=True, explicit=explicit,
+                    success=False, request_kind=request_kind, error=exc, provider=name,
+                    status_code=exc.status_code, latency_ms=(time.perf_counter() - t0) * 1000,
+                )
+                await self._log_event(
+                    level="warning",
+                    source="router",
+                    message=f"provider {name} stream unavailable: {exc}",
+                    provider=name, model=model, request_id=request_id,
+                    details={"status_code": exc.status_code},
+                )
                 continue
             except ProviderRequestError as exc:
                 if len(order) == 1:
                     raise
                 errors.append(f"{name}: {exc}")
                 self._mark_provider_failure(name, exc)
+                await self._record_message_log(
+                    request_id=request_id, req=req, model=model, stream=True, explicit=explicit,
+                    success=False, request_kind=request_kind, error=exc, provider=name,
+                    status_code=exc.status_code, latency_ms=(time.perf_counter() - t0) * 1000,
+                )
+                await self._log_event(
+                    level="error",
+                    source="router",
+                    message=f"provider {name} stream failed: {exc}",
+                    provider=name, model=model, request_id=request_id,
+                    details={"status_code": exc.status_code},
+                )
                 continue
 
         await self._record_router_event(
@@ -231,6 +444,15 @@ class ZeroCostModelRouter(ModelRouter):
             success=False,
             request_kind=request_kind,
             status_code=None,
+            request_id=request_id,
+        )
+        await self._log_event(
+            level="error",
+            source="router",
+            message="all zero-cost providers failed: " + "; ".join(errors),
+            model=req.model,
+            request_id=request_id,
+            details={"errors": errors},
         )
         raise ProviderUnavailable("all zero-cost providers failed: " + "; ".join(errors))
 

@@ -9,7 +9,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
+
+
+def _json_dumps(value: object) -> str:
+    import json
+
+    return json.dumps(value, default=str, ensure_ascii=False)
 
 
 SCHEMA = """
@@ -71,6 +77,7 @@ CREATE TABLE IF NOT EXISTS provider_quota_reservations (
 
 CREATE TABLE IF NOT EXISTS router_request_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL DEFAULT '',
     occurred_at REAL NOT NULL,
     provider_name TEXT,
     model TEXT NOT NULL DEFAULT '',
@@ -99,6 +106,49 @@ CREATE INDEX IF NOT EXISTS idx_router_events_occurred
     ON router_request_events(occurred_at);
 CREATE INDEX IF NOT EXISTS idx_router_events_provider
     ON router_request_events(provider_name);
+
+CREATE TABLE IF NOT EXISTS app_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at REAL NOT NULL,
+    level TEXT NOT NULL DEFAULT 'info',
+    source TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL,
+    provider TEXT,
+    model TEXT,
+    request_id TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_app_events_time
+    ON app_events(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_app_events_provider
+    ON app_events(provider);
+
+CREATE TABLE IF NOT EXISTS router_message_logs (
+    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL DEFAULT '',
+    occurred_at REAL NOT NULL,
+    provider_name TEXT,
+    model TEXT NOT NULL DEFAULT '',
+    stream INTEGER NOT NULL DEFAULT 0,
+    explicit INTEGER NOT NULL DEFAULT 0,
+    success INTEGER NOT NULL,
+    request_kind TEXT NOT NULL DEFAULT 'chat',
+    response_kind TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    latency_ms REAL DEFAULT 0,
+    status_code INTEGER,
+    request_json TEXT NOT NULL DEFAULT '',
+    response_json TEXT NOT NULL DEFAULT '',
+    error_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_logs_time
+    ON router_message_logs(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_message_logs_request
+    ON router_message_logs(request_id);
 """
 
 
@@ -199,6 +249,14 @@ class MetricsDB:
             conn.execute(
                 "ALTER TABLE provider_request_events "
                 "ADD COLUMN response_kind TEXT NOT NULL DEFAULT ''"
+            )
+        router_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(router_request_events)")
+        }
+        if "request_id" not in router_cols:
+            conn.execute(
+                "ALTER TABLE router_request_events "
+                "ADD COLUMN request_id TEXT NOT NULL DEFAULT ''"
             )
 
     @contextmanager
@@ -556,6 +614,7 @@ class MetricsDB:
         latency_ms: float = 0.0,
         status_code: int | None = None,
         occurred_at: float | None = None,
+        request_id: str = "",
     ) -> None:
         with self.transaction() as conn:
             total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
@@ -564,8 +623,8 @@ class MetricsDB:
                 INSERT INTO router_request_events
                 (occurred_at, provider_name, model, stream, explicit, failover_index,
                  request_kind, response_kind, success, prompt_tokens, completion_tokens,
-                 total_tokens, latency_ms, status_code)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 total_tokens, latency_ms, status_code, request_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     time.time() if occurred_at is None else occurred_at,
@@ -582,6 +641,7 @@ class MetricsDB:
                     total_tokens,
                     max(0.0, latency_ms),
                     status_code,
+                    request_id,
                 ),
             )
 
@@ -593,6 +653,299 @@ class MetricsDB:
             LIMIT ?
             """,
             (max(1, limit),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_provider_attempt_metrics(self, days: int = 7) -> list[dict[str, object]]:
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT
+                provider_name,
+                COUNT(*) AS attempts,
+                SUM(success) AS successes,
+                SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures,
+                SUM(prompt_tokens) AS prompt_tokens,
+                SUM(completion_tokens) AS completion_tokens,
+                SUM(total_tokens) AS total_tokens,
+                AVG(latency_ms) AS avg_latency_ms,
+                MIN(latency_ms) AS min_latency_ms,
+                MAX(latency_ms) AS max_latency_ms
+            FROM provider_request_events
+            WHERE occurred_at >= ?
+            GROUP BY provider_name
+            ORDER BY attempts DESC, provider_name
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_router_attempt_metrics(self, days: int = 7) -> list[dict[str, object]]:
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT
+                provider_name,
+                COUNT(*) AS requests,
+                SUM(success) AS successes,
+                SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures,
+                SUM(CASE WHEN failover_index > 0 THEN 1 ELSE 0 END) AS failovers,
+                SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END) AS streams,
+                SUM(CASE WHEN explicit = 1 THEN 1 ELSE 0 END) AS explicit_requests,
+                SUM(prompt_tokens) AS prompt_tokens,
+                SUM(completion_tokens) AS completion_tokens,
+                SUM(total_tokens) AS total_tokens,
+                AVG(latency_ms) AS avg_latency_ms
+            FROM router_request_events
+            WHERE occurred_at >= ? AND provider_name IS NOT NULL
+            GROUP BY provider_name
+            ORDER BY requests DESC, provider_name
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_request_timeline(self, days: int = 30) -> list[dict[str, object]]:
+        cutoff = time.time() - days * 86400
+        provider_rows = self._get_conn().execute(
+            """
+            SELECT
+                date(occurred_at, 'unixepoch') AS day,
+                COUNT(*) AS attempts,
+                SUM(success) AS successes,
+                SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures,
+                SUM(prompt_tokens) AS prompt_tokens,
+                SUM(completion_tokens) AS completion_tokens,
+                SUM(total_tokens) AS total_tokens,
+                AVG(latency_ms) AS avg_latency_ms
+            FROM provider_request_events
+            WHERE occurred_at >= ?
+            GROUP BY day
+            ORDER BY day ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        router_rows = self._get_conn().execute(
+            """
+            SELECT
+                date(occurred_at, 'unixepoch') AS day,
+                SUM(CASE WHEN failover_index > 0 THEN 1 ELSE 0 END) AS failovers
+            FROM router_request_events
+            WHERE occurred_at >= ?
+            GROUP BY day
+            ORDER BY day ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        timeline: dict[str, dict[str, object]] = {}
+        for row in provider_rows:
+            day = str(row["day"])
+            timeline[day] = {
+                "day": day,
+                "attempts": int(row["attempts"] or 0),
+                "successes": int(row["successes"] or 0),
+                "failures": int(row["failures"] or 0),
+                "failovers": 0,
+                "prompt_tokens": int(row["prompt_tokens"] or 0),
+                "completion_tokens": int(row["completion_tokens"] or 0),
+                "total_tokens": int(row["total_tokens"] or 0),
+                "avg_latency_ms": float(row["avg_latency_ms"] or 0.0),
+            }
+        for row in router_rows:
+            day = str(row["day"])
+            bucket = timeline.setdefault(
+                day,
+                {
+                    "day": day,
+                    "attempts": 0,
+                    "successes": 0,
+                    "failures": 0,
+                    "failovers": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "avg_latency_ms": 0.0,
+                },
+            )
+            bucket["failovers"] = int(row["failovers"] or 0)
+        return [timeline[key] for key in sorted(timeline)]
+
+    def get_app_event_breakdown(self, days: int = 7) -> dict[str, dict[str, int]]:
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT level, source, COUNT(*) AS count
+            FROM app_events
+            WHERE occurred_at >= ?
+            GROUP BY level, source
+            """,
+            (cutoff,),
+        ).fetchall()
+        levels: dict[str, int] = {}
+        sources: dict[str, int] = {}
+        for row in rows:
+            count = int(row["count"])
+            levels[row["level"]] = levels.get(row["level"], 0) + count
+            sources[row["source"]] = sources.get(row["source"], 0) + count
+        return {"levels": levels, "sources": sources}
+
+    def record_app_event(
+        self,
+        *,
+        level: str,
+        source: str,
+        message: str,
+        provider: str | None = None,
+        model: str | None = None,
+        request_id: str = "",
+        details: dict[str, object] | None = None,
+        occurred_at: float | None = None,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_events
+                (occurred_at, level, source, message, provider, model, request_id, details_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    time.time() if occurred_at is None else occurred_at,
+                    level,
+                    source,
+                    message,
+                    provider,
+                    model,
+                    request_id,
+                    _json_dumps(details or {}),
+                ),
+            )
+
+    def get_app_events(
+        self,
+        limit: int = 200,
+        *,
+        level: str | None = None,
+        provider: str | None = None,
+        request_id: str | None = None,
+        since: float | None = None,
+        levels: tuple[str, ...] = (),
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if level:
+            clauses.append("level = ?")
+            params.append(level)
+        if levels:
+            clauses.append(f"level IN ({','.join('?' for _ in levels)})")
+            params.extend(levels)
+        if provider:
+            clauses.append("provider = ?")
+            params.append(provider)
+        if request_id:
+            clauses.append("request_id = ?")
+            params.append(request_id)
+        if since is not None:
+            clauses.append("occurred_at >= ?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._get_conn().execute(
+            f"""
+            SELECT * FROM app_events
+            {where}
+            ORDER BY occurred_at DESC
+            LIMIT ?
+            """,
+            (*params, max(1, limit)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_message_log(
+        self,
+        *,
+        request_id: str = "",
+        provider: str | None,
+        model: str,
+        stream: bool,
+        explicit: bool,
+        success: bool,
+        request_kind: str = "chat",
+        response_kind: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: float = 0.0,
+        status_code: int | None = None,
+        request_json: str = "",
+        response_json: str = "",
+        error_json: str = "",
+        occurred_at: float | None = None,
+    ) -> None:
+        with self.transaction() as conn:
+            total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
+            conn.execute(
+                """
+                INSERT INTO router_message_logs
+                (request_id, occurred_at, provider_name, model, stream, explicit, success,
+                 request_kind, response_kind, prompt_tokens, completion_tokens, total_tokens,
+                 latency_ms, status_code, request_json, response_json, error_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    time.time() if occurred_at is None else occurred_at,
+                    provider,
+                    model,
+                    1 if stream else 0,
+                    1 if explicit else 0,
+                    1 if success else 0,
+                    request_kind,
+                    response_kind,
+                    max(0, prompt_tokens),
+                    max(0, completion_tokens),
+                    total_tokens,
+                    max(0.0, latency_ms),
+                    status_code,
+                    request_json,
+                    response_json,
+                    error_json,
+                ),
+            )
+
+    def get_message_logs(
+        self,
+        limit: int = 200,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        request_id: str | None = None,
+        since: float | None = None,
+        success: bool | None = None,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if provider:
+            clauses.append("provider_name = ?")
+            params.append(provider)
+        if model:
+            clauses.append("model = ?")
+            params.append(model)
+        if request_id:
+            clauses.append("request_id = ?")
+            params.append(request_id)
+        if since is not None:
+            clauses.append("occurred_at >= ?")
+            params.append(since)
+        if success is not None:
+            clauses.append("success = ?")
+            params.append(1 if success else 0)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._get_conn().execute(
+            f"""
+            SELECT * FROM router_message_logs
+            {where}
+            ORDER BY occurred_at DESC
+            LIMIT ?
+            """,
+            (*params, max(1, limit)),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -722,6 +1075,8 @@ class MetricsDB:
             conn.execute("DELETE FROM provider_daily_metrics WHERE metric_date < ?", (cutoff_date,))
             conn.execute("DELETE FROM provider_request_events WHERE occurred_at < ?", (cutoff_ts,))
             conn.execute("DELETE FROM router_request_events WHERE occurred_at < ?", (cutoff_ts,))
+            conn.execute("DELETE FROM router_message_logs WHERE occurred_at < ?", (cutoff_ts,))
+            conn.execute("DELETE FROM app_events WHERE occurred_at < ?", (cutoff_ts,))
             conn.execute("DELETE FROM provider_quota_reservations WHERE expires_at <= ?", (now_ts,))
 
     def close(self) -> None:
