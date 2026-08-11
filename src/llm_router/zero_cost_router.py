@@ -115,6 +115,29 @@ class ZeroCostModelRouter(ModelRouter):
         base = classify_task(req.model_dump()) if self.settings.classifier.enabled else TaskProfile(kind="general", confidence=1.0)
         return await refine_task_profile_with_model(self.settings, req.model_dump(), base)
 
+    def _task_specific_fallback_order(self, profile: TaskProfile) -> list[str]:
+        order: list[str] = []
+        if profile.needs_vision:
+            order.extend(["openrouter", "huggingface", "groq"])
+        elif profile.needs_json or profile.needs_tools:
+            order.extend(["openrouter", "groq", "huggingface"])
+        elif profile.coding_heavy:
+            order.extend(["groq", "huggingface", "openrouter"])
+        elif profile.speed_sensitive:
+            order.extend(["groq", "openrouter", "huggingface"])
+        else:
+            order.extend(["groq", "openrouter", "huggingface"])
+        if profile.needs_long_context:
+            order.append("local")
+        return [name for name in order if name in self.providers]
+
+    def _merge_fallback_order(self, names: list[str], profile: TaskProfile) -> list[str]:
+        merged: list[str] = []
+        for name in self._task_specific_fallback_order(profile) + names:
+            if name in names and name not in merged:
+                merged.append(name)
+        return merged or names
+
     async def _order_for_request(self, req: ChatRequest) -> list[tuple[str, str]]:
         if self.settings.strategy != "zero-cost":
             return self._order(req)
@@ -141,7 +164,7 @@ class ZeroCostModelRouter(ModelRouter):
                 and self.settings.provider(score.provider).default_model
             ]
             scores = self._apply_task_profile(scores, profile)
-            names = [score.provider for score in scores]
+            names = self._merge_fallback_order([score.provider for score in scores], profile)
             if req.local_first is True and "local" in names:
                 names.remove("local")
                 names.insert(0, "local")
@@ -151,7 +174,7 @@ class ZeroCostModelRouter(ModelRouter):
 
         scores = [score for score in self.route_scores(primary=primary) if score.eligible]
         scores = self._apply_task_profile(scores, profile)
-        names = [score.provider for score in scores]
+        names = self._merge_fallback_order([score.provider for score in scores], profile)
         if req.local_first is True and "local" in names:
             names.remove("local")
             names.insert(0, "local")
@@ -206,13 +229,14 @@ class ZeroCostModelRouter(ModelRouter):
         request_kind = classify_request_kind({"tools": req.tools, "tool_choice": req.tool_choice})
         explicit = self._is_explicit(req)
         request_id = uuid.uuid4().hex[:16]
+        profile = await self._task_profile(req)
         await self._log_event(
             level="info",
             source="router",
             message=f"zero-cost chat request: model={req.model!r} kind={request_kind} explicit={explicit}",
             model=req.model,
             request_id=request_id,
-            details={"provider_count": len(order)},
+            details={"provider_count": len(order), "task_kind": profile.kind, "task_confidence": profile.confidence},
         )
         for idx, (name, model) in enumerate(order):
             provider = self.providers[name]
@@ -280,6 +304,7 @@ class ZeroCostModelRouter(ModelRouter):
                 explicit=explicit,
                 failover_index=idx,
                 success=True,
+                task_kind=profile.kind,
                 request_kind=request_kind,
                 response_kind=classify_response_kind(data),
                 prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
@@ -311,6 +336,7 @@ class ZeroCostModelRouter(ModelRouter):
             explicit=explicit,
             failover_index=len(order),
             success=False,
+            task_kind=profile.kind,
             request_kind=request_kind,
             status_code=None,
             request_id=request_id,
@@ -321,7 +347,7 @@ class ZeroCostModelRouter(ModelRouter):
             message="all zero-cost providers failed: " + "; ".join(errors),
             model=req.model,
             request_id=request_id,
-            details={"errors": errors},
+            details={"errors": errors, "task_kind": profile.kind, "task_confidence": profile.confidence},
         )
         raise ProviderUnavailable("all zero-cost providers failed: " + "; ".join(errors))
 
@@ -339,13 +365,14 @@ class ZeroCostModelRouter(ModelRouter):
         request_kind = classify_request_kind({"tools": req.tools, "tool_choice": req.tool_choice})
         explicit = self._is_explicit(req)
         request_id = uuid.uuid4().hex[:16]
+        profile = await self._task_profile(req)
         await self._log_event(
             level="info",
             source="router",
             message=f"zero-cost stream request: model={req.model!r} kind={request_kind} explicit={explicit}",
             model=req.model,
             request_id=request_id,
-            details={"provider_count": len(order)},
+            details={"provider_count": len(order), "task_kind": profile.kind, "task_confidence": profile.confidence},
         )
         for idx, (name, model) in enumerate(order):
             provider = self.providers[name]
@@ -366,6 +393,7 @@ class ZeroCostModelRouter(ModelRouter):
                     explicit=explicit,
                     failover_index=idx,
                     success=True,
+                    task_kind=profile.kind,
                     request_kind=request_kind,
                     response_kind="tool_call" if tool_response else "chat",
                     latency_ms=latency_ms,
@@ -442,6 +470,7 @@ class ZeroCostModelRouter(ModelRouter):
             explicit=explicit,
             failover_index=len(order),
             success=False,
+            task_kind=profile.kind,
             request_kind=request_kind,
             status_code=None,
             request_id=request_id,
@@ -452,7 +481,7 @@ class ZeroCostModelRouter(ModelRouter):
             message="all zero-cost providers failed: " + "; ".join(errors),
             model=req.model,
             request_id=request_id,
-            details={"errors": errors},
+            details={"errors": errors, "task_kind": profile.kind, "task_confidence": profile.confidence},
         )
         raise ProviderUnavailable("all zero-cost providers failed: " + "; ".join(errors))
 

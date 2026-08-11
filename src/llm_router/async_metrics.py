@@ -79,6 +79,7 @@ class AsyncMetricsStore:
         explicit: bool,
         failover_index: int,
         success: bool,
+        task_kind: str = "general",
         request_kind: str = "chat",
         response_kind: str = "",
         prompt_tokens: int = 0,
@@ -90,20 +91,21 @@ class AsyncMetricsStore:
     ) -> None:
         await self._call(
             lambda db: db.record_router_event(
-                provider,
-                model,
-                stream,
-                explicit,
-                failover_index,
-                success,
-                request_kind,
-                response_kind,
-                prompt_tokens,
-                completion_tokens,
-                latency_ms,
-                status_code,
-                occurred_at,
-                request_id,
+                provider=provider,
+                model=model,
+                stream=stream,
+                explicit=explicit,
+                failover_index=failover_index,
+                success=success,
+                task_kind=task_kind,
+                request_kind=request_kind,
+                response_kind=response_kind,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=latency_ms,
+                status_code=status_code,
+                occurred_at=occurred_at,
+                request_id=request_id,
             )
         )
 
@@ -118,6 +120,9 @@ class AsyncMetricsStore:
 
     async def get_request_timeline(self, days: int = 30):
         return await self._call(lambda db: db.get_request_timeline(days))
+
+    async def get_task_breakdown(self, days: int = 30):
+        return await self._call(lambda db: db.get_task_breakdown(days))
 
     async def record_app_event(
         self,

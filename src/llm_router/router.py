@@ -353,6 +353,7 @@ class ModelRouter:
         explicit: bool,
         failover_index: int,
         success: bool,
+        task_kind: str = "general",
         request_kind: str,
         response_kind: str = "",
         prompt_tokens: int = 0,
@@ -365,6 +366,7 @@ class ModelRouter:
             await self._metrics_store.record_router_event(
                 provider=provider,
                 model=model,
+                task_kind=task_kind,
                 stream=stream,
                 explicit=explicit,
                 failover_index=failover_index,
@@ -865,6 +867,7 @@ class ModelRouter:
             self._metrics_store.get_app_event_breakdown(days),
             self._metrics_store.get_request_timeline(days),
         )
+        task_breakdown = await self._metrics_store.get_task_breakdown(days)
 
         provider_rows = {row.get("provider_name") or "": row for row in provider_attempts}
         router_rows = {row.get("provider_name") or "": row for row in router_attempts}
@@ -1014,6 +1017,7 @@ class ModelRouter:
                 "currency": analytics.currency,
                 "error_levels": error_levels,
                 "event_sources": app_breakdown.get("sources", {}),
+                "task_breakdown": task_breakdown,
             },
             "timeline": timeline,
             "providers": providers,

@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS router_request_events (
     occurred_at REAL NOT NULL,
     provider_name TEXT,
     model TEXT NOT NULL DEFAULT '',
+    task_kind TEXT NOT NULL DEFAULT 'general',
     stream INTEGER NOT NULL DEFAULT 0,
     explicit INTEGER NOT NULL DEFAULT 0,
     failover_index INTEGER NOT NULL DEFAULT 0,
@@ -257,6 +258,11 @@ class MetricsDB:
             conn.execute(
                 "ALTER TABLE router_request_events "
                 "ADD COLUMN request_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "task_kind" not in router_cols:
+            conn.execute(
+                "ALTER TABLE router_request_events "
+                "ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'general'"
             )
 
     @contextmanager
@@ -607,6 +613,7 @@ class MetricsDB:
         explicit: bool,
         failover_index: int,
         success: bool,
+        task_kind: str = "general",
         request_kind: str = "chat",
         response_kind: str = "",
         prompt_tokens: int = 0,
@@ -621,15 +628,16 @@ class MetricsDB:
             conn.execute(
                 """
                 INSERT INTO router_request_events
-                (occurred_at, provider_name, model, stream, explicit, failover_index,
+                (occurred_at, provider_name, model, task_kind, stream, explicit, failover_index,
                  request_kind, response_kind, success, prompt_tokens, completion_tokens,
                  total_tokens, latency_ms, status_code, request_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     time.time() if occurred_at is None else occurred_at,
                     provider,
                     model,
+                    task_kind,
                     1 if stream else 0,
                     1 if explicit else 0,
                     failover_index,
@@ -679,6 +687,19 @@ class MetricsDB:
             (cutoff,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_task_breakdown(self, days: int = 30) -> dict[str, int]:
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT task_kind, COUNT(*) AS count
+            FROM router_request_events
+            WHERE occurred_at >= ?
+            GROUP BY task_kind
+            """,
+            (cutoff,),
+        ).fetchall()
+        return {row["task_kind"]: int(row["count"]) for row in rows}
 
     def get_router_attempt_metrics(self, days: int = 7) -> list[dict[str, object]]:
         cutoff = time.time() - days * 86400

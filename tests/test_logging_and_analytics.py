@@ -135,6 +135,7 @@ def test_analytics_summary_includes_cost_and_alerts(tmp_path):
         assert data["providers"]["groq"]["failover_rate"] == pytest.approx(0.2)
         assert len(data["timeline"]) == 1
         assert data["timeline"][0]["attempts"] == 5
+        assert data["summary"]["task_breakdown"]
         assert any(alert["severity"] in {"warning", "critical"} for alert in data["alerts"])
 
     asyncio.run(run())

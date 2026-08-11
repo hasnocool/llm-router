@@ -269,6 +269,7 @@ function renderAnalytics() {
   const summary = analytics.summary || {};
   const providers = analytics.providers || {};
   const timeline = analytics.timeline || [];
+  const taskBreakdown = summary.task_breakdown || {};
   const providerNames = Object.keys(providers);
   const currency = summary.currency || "USD";
 
@@ -354,6 +355,16 @@ function renderAnalytics() {
       label: "Events",
       data: errorLabels.map((name) => errorLevels[name] || 0),
       backgroundColor: errorLabels.map((name) => name === "error" ? "#f85149" : name === "warning" ? "#d29922" : "#4c9aff"),
+    }],
+    { scales: { y: { beginAtZero: true, ticks: { color: "#8b98a5" }, grid: { color: "#2d3646" } }, x: { ticks: { color: "#8b98a5" }, grid: { color: "#2d3646" } } } }
+  );
+
+  const taskLabels = Object.keys(taskBreakdown);
+  makeChart("chart-tasks", null, taskLabels,
+    [{
+      label: "Tasks",
+      data: taskLabels.map((name) => taskBreakdown[name] || 0),
+      backgroundColor: "#b77bf1",
     }],
     { scales: { y: { beginAtZero: true, ticks: { color: "#8b98a5" }, grid: { color: "#2d3646" } }, x: { ticks: { color: "#8b98a5" }, grid: { color: "#2d3646" } } } }
   );
