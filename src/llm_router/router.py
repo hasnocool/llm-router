@@ -16,7 +16,14 @@ from .config import Settings, normalize_provider
 from .metrics_db import QuotaConfig
 from .metrics_report import MetricsReportGenerator
 from .providers import build_provider, set_metrics_store
-from .providers.base import Provider, ProviderRequestError, ProviderUnavailable, QuotaExceededError
+from .providers.base import (
+    Provider,
+    ProviderRequestError,
+    ProviderUnavailable,
+    QuotaExceededError,
+    classify_request_kind,
+    classify_response_kind,
+)
 from .schemas import ChatMessage, ChatRequest, ChatResponse, ChatUsage, Choice, ModelInfo
 
 
@@ -224,6 +231,10 @@ class ModelRouter:
             reverse=True,
         )
 
+    def provider_matrix_view(self) -> list[dict[str, Any]]:
+        """Matrix-aware ranking view. Only meaningful under the zero-cost strategy."""
+        return []
+
 # --- routing ------------------------------------------------------
 
     def _routing_pool(self) -> list[str]:
@@ -231,6 +242,62 @@ class ModelRouter:
         if self.settings.routing_providers:
             return [n for n in self.settings.routing_providers if n in self.providers]
         return list(self.providers.keys())
+
+    def _is_explicit(self, req: ChatRequest) -> bool:
+        colon_provider = req.model.partition(":")[0] if ":" in req.model else None
+        return bool(req.provider or normalize_provider(colon_provider) in self.providers)
+
+    @staticmethod
+    def _sse_has_tool_call(line: str) -> bool:
+        if not line.startswith("data:"):
+            return False
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            return False
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            return False
+        for choice in obj.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if delta.get("tool_calls"):
+                return True
+        return False
+
+    async def _record_router_event(
+        self,
+        *,
+        provider: str | None,
+        model: str,
+        stream: bool,
+        explicit: bool,
+        failover_index: int,
+        success: bool,
+        request_kind: str,
+        response_kind: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: float = 0.0,
+        status_code: int | None = None,
+    ) -> None:
+        try:
+            await self._metrics_store.record_router_event(
+                provider=provider,
+                model=model,
+                stream=stream,
+                explicit=explicit,
+                failover_index=failover_index,
+                success=success,
+                request_kind=request_kind,
+                response_kind=response_kind,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=latency_ms,
+                status_code=status_code,
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("router event recording failed")
 
     def _order(self, req: ChatRequest) -> list[tuple[str, str]]:
         local_first = req.local_first if req.local_first is not None else self.settings.strategy == "local-first"
@@ -304,7 +371,9 @@ class ModelRouter:
         order = self._order(req)
         if not order:
             raise ProviderUnavailable("no providers configured")
-        for name, model in order:
+        request_kind = classify_request_kind({"tools": req.tools, "tool_choice": req.tool_choice})
+        explicit = self._is_explicit(req)
+        for idx, (name, model) in enumerate(order):
             provider = self.providers[name]
             t0 = time.perf_counter()
             try:
@@ -316,9 +385,36 @@ class ModelRouter:
                 self._mark_provider_failure(name, exc)
                 errors.append(f"{name}: {exc}")
                 continue
-            self._mark_provider_success(name, (time.perf_counter() - t0) * 1000)
+            latency_ms = (time.perf_counter() - t0) * 1000
+            self._mark_provider_success(name, latency_ms)
             await self._enrich_status_with_metrics(name)
+            raw_usage = data.get("usage")
+            usage = raw_usage if isinstance(raw_usage, dict) else {}
+            await self._record_router_event(
+                provider=name,
+                model=model,
+                stream=False,
+                explicit=explicit,
+                failover_index=idx,
+                success=True,
+                request_kind=request_kind,
+                response_kind=classify_response_kind(data),
+                prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+                latency_ms=latency_ms,
+                status_code=200,
+            )
             return self._to_response(data, model, provider_name=name)
+        await self._record_router_event(
+            provider=None,
+            model=req.model,
+            stream=False,
+            explicit=explicit,
+            failover_index=len(order),
+            success=False,
+            request_kind=request_kind,
+            status_code=None,
+        )
         raise ProviderUnavailable("all providers failed: " + "; ".join(errors))
 
     def _to_response(self, data: dict[str, Any], model: str, provider_name: str) -> ChatResponse:
@@ -354,14 +450,32 @@ class ModelRouter:
         order = self._order(req)
         if not order:
             raise ProviderUnavailable("no providers configured")
+        request_kind = classify_request_kind({"tools": req.tools, "tool_choice": req.tool_choice})
+        explicit = self._is_explicit(req)
         for idx, (name, model) in enumerate(order):
             provider = self.providers[name]
             t0 = time.perf_counter()
+            tool_response = False
             try:
                 async for line in provider.stream(self._payload(req, model)):
+                    if self._sse_has_tool_call(line):
+                        tool_response = True
                     yield self._annotate_sse(line, name)
-                self._mark_provider_success(name, (time.perf_counter() - t0) * 1000)
+                latency_ms = (time.perf_counter() - t0) * 1000
+                self._mark_provider_success(name, latency_ms)
                 await self._enrich_status_with_metrics(name)
+                await self._record_router_event(
+                    provider=name,
+                    model=model,
+                    stream=True,
+                    explicit=explicit,
+                    failover_index=idx,
+                    success=True,
+                    request_kind=request_kind,
+                    response_kind="tool_call" if tool_response else "chat",
+                    latency_ms=latency_ms,
+                    status_code=200,
+                )
                 return
             except QuotaExceededError as exc:
                 self._mark_provider_failure(name, exc)
@@ -373,6 +487,16 @@ class ModelRouter:
                 errors.append(f"{name}: {exc}")
                 if idx < len(order) - 1:
                     continue
+                await self._record_router_event(
+                    provider=None,
+                    model=req.model,
+                    stream=True,
+                    explicit=explicit,
+                    failover_index=len(order),
+                    success=False,
+                    request_kind=request_kind,
+                    status_code=exc.status_code,
+                )
                 raise ProviderUnavailable("all providers failed: " + "; ".join(errors)) from exc
 
     @staticmethod
@@ -498,3 +622,113 @@ class ModelRouter:
             *(self.get_provider_metrics(provider, days) for provider in self.providers)
         )
         return dict(zip(self.providers, values))
+
+    async def get_dashboard_data(self, days: int = 7, events: int = 50) -> dict[str, Any]:
+        """Aggregate everything the dashboard renders into a single payload."""
+        await self.refresh_status_from_metrics()
+        daily = await asyncio.gather(
+            *(self._metrics_store.get_daily_metrics(name, days) for name in self.providers)
+        )
+        today = await asyncio.gather(
+            *(self._metrics_store.get_today_metrics(name) for name in self.providers)
+        )
+        quotas = await asyncio.gather(
+            *(self._metrics_store.get_remaining_quota(name) for name in self.providers)
+        )
+        rate_limits = await asyncio.gather(
+            *(self._metrics_store.get_rate_limits(name) for name in self.providers)
+        )
+        kind_breakdown = await self._metrics_store.get_kind_breakdown(days)
+        recent_events = await self._metrics_store.get_recent_router_events(events)
+        models = await self.list_models()
+
+        providers: dict[str, Any] = {}
+        total_calls = 0
+        total_failed = 0
+        total_tokens = 0
+        total_calls_remaining = 0
+        total_tokens_remaining = 0
+        rate_limit_warnings = 0
+        for idx, name in enumerate(self.providers):
+            status = self.status[name]
+            today_metrics = today[idx]
+            quota = quotas[idx]
+            history = [
+                {
+                    "date": item.metric_date.isoformat(),
+                    "calls": item.api_calls_total,
+                    "failed": item.api_calls_failed,
+                    "prompt_tokens": item.prompt_tokens,
+                    "completion_tokens": item.completion_tokens,
+                    "total_tokens": item.total_tokens,
+                    "latency_p50_ms": item.latency_p50_ms,
+                    "latency_p99_ms": item.latency_p99_ms,
+                }
+                for item in daily[idx]
+            ]
+            calls_used = today_metrics.api_calls_total if today_metrics else 0
+            calls_failed = today_metrics.api_calls_failed if today_metrics else 0
+            tokens_used = today_metrics.total_tokens if today_metrics else 0
+            calls_remaining = quota.get("requests_remaining")
+            tokens_remaining = quota.get("tokens_remaining")
+            total_calls += calls_used
+            total_failed += calls_failed
+            total_tokens += tokens_used
+            if calls_remaining is not None:
+                total_calls_remaining += calls_remaining
+            if tokens_remaining is not None:
+                total_tokens_remaining += tokens_remaining
+            if status.rate_limit_remaining == 0:
+                rate_limit_warnings += 1
+            providers[name] = {
+                "name": name,
+                "available": status.available,
+                "model_count": status.model_count,
+                "last_error": status.last_error,
+                "last_polled": status.last_polled,
+                "daily_calls_used": calls_used,
+                "daily_calls_failed": calls_failed,
+                "daily_calls_remaining": calls_remaining,
+                "daily_tokens_used": tokens_used,
+                "daily_tokens_remaining": tokens_remaining,
+                "rate_limit_remaining": status.rate_limit_remaining,
+                "rate_limit_reset": status.rate_limit_reset,
+                "latency_p50_ms": status.latency_p50_ms,
+                "latency_p99_ms": status.latency_p99_ms,
+                "rate_limits": [
+                    {
+                        "type": item.limit_type,
+                        "limit": item.limit_value,
+                        "remaining": item.remaining,
+                        "reset": item.reset_timestamp,
+                        "source": item.header_source,
+                    }
+                    for item in rate_limits[idx]
+                ],
+                "history": history,
+            }
+
+        matrix = self.provider_matrix_view()
+
+        return {
+            "strategy": self.settings.strategy,
+            "generated_at": time.time(),
+            "summary": {
+                "calls_today": total_calls,
+                "failed_today": total_failed,
+                "success_today": total_calls - total_failed,
+                "tokens_today": total_tokens,
+                "providers_configured": len(self.providers),
+                "providers_eligible": sum(
+                    1 for item in matrix if item.get("routing", {}).get("eligible")
+                ),
+                "calls_remaining": total_calls_remaining,
+                "tokens_remaining": total_tokens_remaining,
+                "rate_limit_warnings": rate_limit_warnings,
+                "kind_breakdown": kind_breakdown,
+            },
+            "providers": providers,
+            "matrix": matrix,
+            "models": [{"id": item.id, "owned_by": item.owned_by} for item in models],
+            "recent_events": recent_events,
+        }

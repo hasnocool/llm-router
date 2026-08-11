@@ -54,7 +54,8 @@ class AsyncMetricsStore:
         completion_tokens: int = 0,
         latency_ms: float = 0.0,
         status_code: int | None = None,
-        request_kind: str = "inference",
+        request_kind: str = "chat",
+        response_kind: str = "",
     ) -> None:
         await self._call(
             lambda db: db.reconcile_reservation(
@@ -66,8 +67,49 @@ class AsyncMetricsStore:
                 latency_ms,
                 status_code,
                 request_kind,
+                response_kind,
             )
         )
+
+    async def record_router_event(
+        self,
+        provider: str | None,
+        model: str,
+        stream: bool,
+        explicit: bool,
+        failover_index: int,
+        success: bool,
+        request_kind: str = "chat",
+        response_kind: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: float = 0.0,
+        status_code: int | None = None,
+        occurred_at: float | None = None,
+    ) -> None:
+        await self._call(
+            lambda db: db.record_router_event(
+                provider,
+                model,
+                stream,
+                explicit,
+                failover_index,
+                success,
+                request_kind,
+                response_kind,
+                prompt_tokens,
+                completion_tokens,
+                latency_ms,
+                status_code,
+                occurred_at,
+            )
+        )
+
+    async def get_recent_router_events(self, limit: int = 100):
+        return await self._call(lambda db: db.get_recent_router_events(limit))
+
+    async def get_kind_breakdown(self, days: int = 7):
+        return await self._call(lambda db: db.get_kind_breakdown(days))
 
     async def cancel_reservation(self, reservation_id: str | None) -> None:
         await self._call(lambda db: db.cancel_reservation(reservation_id))

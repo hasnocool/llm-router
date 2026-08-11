@@ -22,6 +22,9 @@
 
 ### Added
 
+- Web dashboard (`GET /dashboard`) with auto-refreshing summary cards, per-provider usage bars, routing matrix, model list, request-kind breakdown, traffic charts, and recent routing events, plus an aggregated `GET /dashboard/api` endpoint (Chart.js vendored locally for offline use).
+- Request/response classification in metrics: chat vs tool-call requests and whether each completion returned tool calls, recorded per provider event.
+- Per-request routing decision log (`router_request_events`): served provider, model, stream/explicit flags, failover index, request/response kind, tokens, latency and status.
 - Long-lived model-discovery cache with exponential failure backoff and explicit refresh.
 - OpenAI-compatible tool, tool-choice, structured-output, and multimodal request fields.
 - Optional `ROUTER_API_KEY` protection for `/v1/*` endpoints.
@@ -29,3 +32,4 @@
 - Python 3.12 GitHub Actions CI with pytest, compile checks, Ruff critical checks, and required Pyright type checking.
 - Streaming failover coverage: an HTTP 413 from the primary provider now falls through to the next zero-cost route.
 - ASGI streaming regression coverage for router-owned header/context lifecycle.
+- Dashboard/classification regression tests.

@@ -8,7 +8,13 @@ import httpx
 
 from .config import Settings, normalize_provider
 from .provider_matrix import get_provider_matrix_entry, load_provider_matrix
-from .providers.base import ProviderRequestError, ProviderUnavailable, QuotaExceededError
+from .providers.base import (
+    ProviderRequestError,
+    ProviderUnavailable,
+    QuotaExceededError,
+    classify_request_kind,
+    classify_response_kind,
+)
 from .router import ModelRouter, ProviderStatus
 from .routing_score import RouteScore, ZeroCostPolicy, route_sort_key, runtime_route_score
 from .schemas import ChatRequest, ChatResponse
@@ -109,7 +115,9 @@ class ZeroCostModelRouter(ModelRouter):
         if not order:
             raise ProviderUnavailable("no zero-cost providers are currently eligible")
 
-        for name, model in order:
+        request_kind = classify_request_kind({"tools": req.tools, "tool_choice": req.tool_choice})
+        explicit = self._is_explicit(req)
+        for idx, (name, model) in enumerate(order):
             provider = self.providers[name]
             t0 = time.perf_counter()
             try:
@@ -128,10 +136,37 @@ class ZeroCostModelRouter(ModelRouter):
                 errors.append(f"{name}: {exc}")
                 self._mark_provider_failure(name, exc)
                 continue
-            self._mark_provider_success(name, (time.perf_counter() - t0) * 1000)
+            latency_ms = (time.perf_counter() - t0) * 1000
+            self._mark_provider_success(name, latency_ms)
             await self._enrich_status_with_metrics(name)
+            raw_usage = data.get("usage")
+            usage = raw_usage if isinstance(raw_usage, dict) else {}
+            await self._record_router_event(
+                provider=name,
+                model=model,
+                stream=False,
+                explicit=explicit,
+                failover_index=idx,
+                success=True,
+                request_kind=request_kind,
+                response_kind=classify_response_kind(data),
+                prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+                latency_ms=latency_ms,
+                status_code=200,
+            )
             return self._to_response(data, model, provider_name=name)
 
+        await self._record_router_event(
+            provider=None,
+            model=req.model,
+            stream=False,
+            explicit=explicit,
+            failover_index=len(order),
+            success=False,
+            request_kind=request_kind,
+            status_code=None,
+        )
         raise ProviderUnavailable("all zero-cost providers failed: " + "; ".join(errors))
 
     async def stream(self, req: ChatRequest) -> AsyncIterator[str]:
@@ -145,14 +180,32 @@ class ZeroCostModelRouter(ModelRouter):
         if not order:
             raise ProviderUnavailable("no zero-cost providers are currently eligible")
 
-        for name, model in order:
+        request_kind = classify_request_kind({"tools": req.tools, "tool_choice": req.tool_choice})
+        explicit = self._is_explicit(req)
+        for idx, (name, model) in enumerate(order):
             provider = self.providers[name]
             t0 = time.perf_counter()
+            tool_response = False
             try:
                 async for line in provider.stream(self._payload(req, model)):
+                    if self._sse_has_tool_call(line):
+                        tool_response = True
                     yield self._annotate_sse(line, name)
-                self._mark_provider_success(name, (time.perf_counter() - t0) * 1000)
+                latency_ms = (time.perf_counter() - t0) * 1000
+                self._mark_provider_success(name, latency_ms)
                 await self._enrich_status_with_metrics(name)
+                await self._record_router_event(
+                    provider=name,
+                    model=model,
+                    stream=True,
+                    explicit=explicit,
+                    failover_index=idx,
+                    success=True,
+                    request_kind=request_kind,
+                    response_kind="tool_call" if tool_response else "chat",
+                    latency_ms=latency_ms,
+                    status_code=200,
+                )
                 return
             except QuotaExceededError as exc:
                 errors.append(f"{name}: {exc}")
@@ -169,6 +222,16 @@ class ZeroCostModelRouter(ModelRouter):
                 self._mark_provider_failure(name, exc)
                 continue
 
+        await self._record_router_event(
+            provider=None,
+            model=req.model,
+            stream=True,
+            explicit=explicit,
+            failover_index=len(order),
+            success=False,
+            request_kind=request_kind,
+            status_code=None,
+        )
         raise ProviderUnavailable("all zero-cost providers failed: " + "; ".join(errors))
 
     def _mark_quota_exhausted(self, name: str) -> None:

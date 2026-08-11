@@ -50,6 +50,8 @@ With the current matrix, configured recurring providers such as Groq and Hugging
 | `GET /v1/provider-matrix` | Configured provider metadata, eligibility reasons, static score and live dynamic score |
 | `GET /v1/metrics` | Router metrics for all providers |
 | `GET /v1/metrics/{provider}` | Metrics for one provider |
+| `GET /dashboard` | Single-page web dashboard (no auth; localhost friendly) |
+| `GET /dashboard/api?days=7&events=50` | Aggregated JSON backing the dashboard |
 | `POST /v1/chat/completions` | OpenAI-compatible chat completion (streaming + non-streaming) |
 
 ## Setup

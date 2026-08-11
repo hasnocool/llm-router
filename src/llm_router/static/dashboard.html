@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-router dashboard</title>
+<link rel="stylesheet" href="/static/dashboard.css">
+<script src="/static/vendor/chart.umd.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>llm-router <span id="strategy" class="badge"></span></h1>
+  <div class="controls">
+    <label class="toggle">
+      <input type="checkbox" id="autorefresh" checked>
+      Auto-refresh (5s)
+    </label>
+    <span id="status" class="status"></span>
+    <span id="updated" class="updated"></span>
+  </div>
+</header>
+
+<section class="cards" id="summary"></section>
+
+<section class="panel">
+  <h2>Traffic</h2>
+  <div class="chart-row">
+    <div class="chart-box"><h3>Calls per day</h3><canvas id="chart-calls"></canvas></div>
+    <div class="chart-box"><h3>Tokens per day</h3><canvas id="chart-tokens"></canvas></div>
+    <div class="chart-box"><h3>Latency p50 (ms)</h3><canvas id="chart-latency"></canvas></div>
+  </div>
+  <div class="range">
+    <label>Days: <select id="days">
+      <option value="7">7</option>
+      <option value="30">30</option>
+      <option value="90">90</option>
+    </select></label>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Providers</h2>
+  <table id="providers">
+    <thead>
+      <tr>
+        <th>Provider</th><th>Status</th><th>Models</th>
+        <th>Calls used / remaining</th><th>Tokens used / remaining</th>
+        <th>Rate limit</th><th>Latency p50/p99</th><th>Last error</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>Routing matrix</h2>
+  <table id="matrix">
+    <thead>
+      <tr>
+        <th>Provider</th><th>Free class</th><th>Static</th><th>Dynamic</th>
+        <th>Eligible</th><th>Reasons</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>Models</h2>
+  <table id="models">
+    <thead><tr><th>ID</th><th>Owned by</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>Request kinds</h2>
+  <div class="kind-grid"><div id="kind-chart"><canvas id="chart-kinds"></canvas></div></div>
+</section>
+
+<section class="panel">
+  <h2>Recent routing events</h2>
+  <table id="events">
+    <thead>
+      <tr>
+        <th>Time</th><th>Provider</th><th>Model</th><th>Kind</th><th>Response</th>
+        <th>Stream/Explicit</th><th>Failover</th><th>Success</th><th>Tokens</th><th>Latency</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<script src="/static/dashboard.js"></script>
+</body>
+</html>

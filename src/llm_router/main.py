@@ -4,12 +4,15 @@ from __future__ import annotations
 import hmac
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from .config import ConfigError, load_settings
+from .dashboard import router as dashboard_router
 from .providers.base import (
     ProviderRequestError,
     ProviderUnavailable,
@@ -57,6 +60,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="llm-router", version="0.1.0", lifespan=lifespan)
+
+app.include_router(dashboard_router)
+app.mount(
+    "/static",
+    StaticFiles(directory=Path(__file__).resolve().parent / "static"),
+    name="static",
+)
 
 
 @app.middleware("http")

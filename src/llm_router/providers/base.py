@@ -93,6 +93,23 @@ def estimate_request_tokens(payload: dict[str, Any]) -> int:
     return input_estimate + max(0, output_estimate)
 
 
+def classify_request_kind(payload: dict[str, Any]) -> str:
+    if payload.get("tools") or payload.get("tool_choice"):
+        return "tool_call"
+    return "chat"
+
+
+def classify_response_kind(data: dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    choice = choices[0] if choices else {}
+    message = choice.get("message") or {}
+    if message.get("tool_calls"):
+        return "tool_call"
+    if choice.get("finish_reason") == "tool_calls":
+        return "tool_call"
+    return "chat"
+
+
 class Provider:
     def __init__(
         self,
@@ -162,7 +179,8 @@ class Provider:
         completion_tokens: int = 0,
         latency_ms: float = 0.0,
         status_code: int | None = None,
-        request_kind: str = "inference",
+        request_kind: str = "chat",
+        response_kind: str = "",
     ) -> None:
         if self._metrics_store is None:
             return
@@ -175,6 +193,7 @@ class Provider:
             latency_ms,
             status_code,
             request_kind,
+            response_kind,
         )
 
     async def models(self) -> list[dict[str, Any]]:
@@ -218,6 +237,7 @@ class Provider:
 
     async def complete(self, payload: dict[str, Any]) -> dict[str, Any]:
         reservation_id = await self._reserve_quota(payload)
+        request_kind = classify_request_kind(payload)
         t0 = time.perf_counter()
         status_code: int | None = None
         try:
@@ -238,6 +258,7 @@ class Provider:
                 success=False,
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 status_code=status_code,
+                request_kind=request_kind,
             )
             raise ProviderUnavailable(f"{self.name} unreachable: {exc}") from exc
         except (ProviderUnavailable, ProviderRequestError):
@@ -246,6 +267,7 @@ class Provider:
                 success=False,
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 status_code=status_code,
+                request_kind=request_kind,
             )
             raise
 
@@ -256,17 +278,21 @@ class Provider:
             completion_tokens=completion_tokens,
             latency_ms=(time.perf_counter() - t0) * 1000,
             status_code=status_code,
+            request_kind=request_kind,
+            response_kind=classify_response_kind(data),
         )
         return data
 
     async def stream(self, payload: dict[str, Any]) -> AsyncIterator[str]:
         reservation_id = await self._reserve_quota(payload)
+        request_kind = classify_request_kind(payload)
         t0 = time.perf_counter()
         emitted = False
         prompt_tokens = 0
         completion_tokens = 0
         status_code: int | None = None
         recorded = False
+        tool_response = False
         try:
             async with self._http.stream(
                 "POST",
@@ -285,6 +311,8 @@ class Provider:
                     if usage:
                         prompt_tokens = max(prompt_tokens, usage[0])
                         completion_tokens = max(completion_tokens, usage[1])
+                    if self._stream_chunk_has_tool_calls(line):
+                        tool_response = True
                     yield line
             await self._record_attempt(
                 reservation_id=reservation_id,
@@ -293,6 +321,8 @@ class Provider:
                 completion_tokens=completion_tokens,
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 status_code=status_code,
+                request_kind=request_kind,
+                response_kind="tool_call" if tool_response else "chat",
             )
             recorded = True
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
@@ -303,6 +333,7 @@ class Provider:
                 completion_tokens=completion_tokens,
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 status_code=status_code,
+                request_kind=request_kind,
             )
             recorded = True
             if emitted:
@@ -316,12 +347,30 @@ class Provider:
                 completion_tokens=completion_tokens,
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 status_code=status_code,
+                request_kind=request_kind,
             )
             recorded = True
             raise
         finally:
             if not recorded and self._metrics_store is not None:
                 await self._metrics_store.cancel_reservation(reservation_id)
+
+    @staticmethod
+    def _stream_chunk_has_tool_calls(line: str) -> bool:
+        if not line.startswith("data:"):
+            return False
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            return False
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            return False
+        for choice in obj.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if delta.get("tool_calls"):
+                return True
+        return False
 
     @staticmethod
     def _extract_streaming_usage(line: str) -> tuple[int, int] | None:

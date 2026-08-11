@@ -10,7 +10,14 @@ import httpx
 
 from ..async_metrics import AsyncMetricsStore
 from ..config import ProviderConfig
-from .base import Provider, ProviderRequestError, ProviderUnavailable, get_forwarded_request_headers
+from .base import (
+    Provider,
+    ProviderRequestError,
+    ProviderUnavailable,
+    classify_request_kind,
+    classify_response_kind,
+    get_forwarded_request_headers,
+)
 
 
 class GoogleAIProvider(Provider):
@@ -334,6 +341,7 @@ class GoogleAIProvider(Provider):
 
     async def complete(self, payload: dict[str, Any]) -> dict[str, Any]:
         reservation_id = await self._reserve_quota(payload)
+        request_kind = classify_request_kind(payload)
         model = payload.get("model", self.config.default_model)
         t0 = time.perf_counter()
         status_code: int | None = None
@@ -350,11 +358,12 @@ class GoogleAIProvider(Provider):
             data = resp.json()
             prompt_tokens, completion_tokens = self._usage(data)
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
-            await self._record_attempt(reservation_id=reservation_id, success=False, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code)
+            await self._record_attempt(reservation_id=reservation_id, success=False, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code, request_kind=request_kind)
             raise ProviderUnavailable(f"{self.name} unreachable: {exc}") from exc
         except (ProviderUnavailable, ProviderRequestError):
-            await self._record_attempt(reservation_id=reservation_id, success=False, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code)
+            await self._record_attempt(reservation_id=reservation_id, success=False, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code, request_kind=request_kind)
             raise
+        converted = self._gemini_to_openai(data, model)
         await self._record_attempt(
             reservation_id=reservation_id,
             success=True,
@@ -362,11 +371,14 @@ class GoogleAIProvider(Provider):
             completion_tokens=completion_tokens,
             latency_ms=(time.perf_counter() - t0) * 1000,
             status_code=status_code,
+            request_kind=request_kind,
+            response_kind=classify_response_kind(converted),
         )
-        return self._gemini_to_openai(data, model)
+        return converted
 
     async def stream(self, payload: dict[str, Any]) -> AsyncIterator[str]:
         reservation_id = await self._reserve_quota(payload)
+        request_kind = classify_request_kind(payload)
         model = payload.get("model", self.config.default_model)
         t0 = time.perf_counter()
         prompt_tokens = 0
@@ -374,6 +386,7 @@ class GoogleAIProvider(Provider):
         status_code: int | None = None
         emitted = False
         recorded = False
+        tool_response = False
         try:
             async with self._http.stream(
                 "POST",
@@ -401,6 +414,8 @@ class GoogleAIProvider(Provider):
                     chunk = self._gemini_stream_chunk(data, model)
                     if chunk:
                         emitted = True
+                        if self._stream_chunk_has_tool_calls(chunk):
+                            tool_response = True
                         yield chunk
             yield "data: [DONE]"
             await self._record_attempt(
@@ -410,16 +425,18 @@ class GoogleAIProvider(Provider):
                 completion_tokens=completion_tokens,
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 status_code=status_code,
+                request_kind=request_kind,
+                response_kind="tool_call" if tool_response else "chat",
             )
             recorded = True
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
-            await self._record_attempt(reservation_id=reservation_id, success=False, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code)
+            await self._record_attempt(reservation_id=reservation_id, success=False, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code, request_kind=request_kind)
             recorded = True
             if emitted:
                 raise
             raise ProviderUnavailable(f"{self.name} unreachable during stream: {exc}") from exc
         except (ProviderUnavailable, ProviderRequestError):
-            await self._record_attempt(reservation_id=reservation_id, success=False, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code)
+            await self._record_attempt(reservation_id=reservation_id, success=False, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, latency_ms=(time.perf_counter() - t0) * 1000, status_code=status_code, request_kind=request_kind)
             recorded = True
             raise
         finally:

@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS provider_request_events (
     total_tokens INTEGER DEFAULT 0,
     latency_ms REAL DEFAULT 0,
     status_code INTEGER,
-    request_kind TEXT NOT NULL DEFAULT 'inference'
+    request_kind TEXT NOT NULL DEFAULT 'chat',
+    response_kind TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS provider_quota_reservations (
@@ -68,6 +69,24 @@ CREATE TABLE IF NOT EXISTS provider_quota_reservations (
     reserved_tokens INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS router_request_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at REAL NOT NULL,
+    provider_name TEXT,
+    model TEXT NOT NULL DEFAULT '',
+    stream INTEGER NOT NULL DEFAULT 0,
+    explicit INTEGER NOT NULL DEFAULT 0,
+    failover_index INTEGER NOT NULL DEFAULT 0,
+    request_kind TEXT NOT NULL DEFAULT 'chat',
+    response_kind TEXT NOT NULL DEFAULT '',
+    success INTEGER NOT NULL,
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    latency_ms REAL DEFAULT 0,
+    status_code INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_daily_metrics_date
     ON provider_daily_metrics(metric_date);
 CREATE INDEX IF NOT EXISTS idx_daily_metrics_provider
@@ -76,6 +95,10 @@ CREATE INDEX IF NOT EXISTS idx_request_events_provider_time
     ON provider_request_events(provider_name, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_quota_reservations_provider
     ON provider_quota_reservations(provider_name, expires_at);
+CREATE INDEX IF NOT EXISTS idx_router_events_occurred
+    ON router_request_events(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_router_events_provider
+    ON router_request_events(provider_name);
 """
 
 
@@ -163,7 +186,20 @@ class MetricsDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._get_conn()
         conn.executescript(SCHEMA)
+        conn.execute("PRAGMA user_version")
+        self._migrate(conn)
         conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add columns introduced after the original schema to existing databases."""
+        events_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(provider_request_events)")
+        }
+        if "response_kind" not in events_cols:
+            conn.execute(
+                "ALTER TABLE provider_request_events "
+                "ADD COLUMN response_kind TEXT NOT NULL DEFAULT ''"
+            )
 
     @contextmanager
     def transaction(self, *, immediate: bool = False):
@@ -211,6 +247,7 @@ class MetricsDB:
         status_code: int | None,
         request_kind: str,
         occurred_at: float,
+        response_kind: str = "",
     ) -> None:
         metric_date = datetime.fromtimestamp(occurred_at, tz=timezone.utc).date().isoformat()
         total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
@@ -218,8 +255,8 @@ class MetricsDB:
             """
             INSERT INTO provider_request_events
             (provider_name, occurred_at, success, prompt_tokens, completion_tokens,
-             total_tokens, latency_ms, status_code, request_kind)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             total_tokens, latency_ms, status_code, request_kind, response_kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 provider,
@@ -231,6 +268,7 @@ class MetricsDB:
                 max(0.0, latency_ms),
                 status_code,
                 request_kind,
+                response_kind,
             ),
         )
         conn.execute(
@@ -268,7 +306,8 @@ class MetricsDB:
         completion_tokens: int = 0,
         latency_ms: float = 0.0,
         status_code: int | None = None,
-        request_kind: str = "inference",
+        request_kind: str = "chat",
+        response_kind: str = "",
     ) -> None:
         with self.transaction() as conn:
             self._record_request_conn(
@@ -281,6 +320,7 @@ class MetricsDB:
                 status_code,
                 request_kind,
                 time.time(),
+                response_kind=response_kind,
             )
 
     def upsert_rate_limits(self, provider: str, limits: Iterable[object]) -> None:
@@ -479,7 +519,8 @@ class MetricsDB:
         completion_tokens: int = 0,
         latency_ms: float = 0.0,
         status_code: int | None = None,
-        request_kind: str = "inference",
+        request_kind: str = "chat",
+        response_kind: str = "",
     ) -> None:
         with self.transaction(immediate=True) as conn:
             if reservation_id:
@@ -497,7 +538,89 @@ class MetricsDB:
                 status_code,
                 request_kind,
                 time.time(),
+                response_kind=response_kind,
             )
+
+    def record_router_event(
+        self,
+        provider: str | None,
+        model: str,
+        stream: bool,
+        explicit: bool,
+        failover_index: int,
+        success: bool,
+        request_kind: str = "chat",
+        response_kind: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: float = 0.0,
+        status_code: int | None = None,
+        occurred_at: float | None = None,
+    ) -> None:
+        with self.transaction() as conn:
+            total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
+            conn.execute(
+                """
+                INSERT INTO router_request_events
+                (occurred_at, provider_name, model, stream, explicit, failover_index,
+                 request_kind, response_kind, success, prompt_tokens, completion_tokens,
+                 total_tokens, latency_ms, status_code)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    time.time() if occurred_at is None else occurred_at,
+                    provider,
+                    model,
+                    1 if stream else 0,
+                    1 if explicit else 0,
+                    failover_index,
+                    request_kind,
+                    response_kind,
+                    1 if success else 0,
+                    max(0, prompt_tokens),
+                    max(0, completion_tokens),
+                    total_tokens,
+                    max(0.0, latency_ms),
+                    status_code,
+                ),
+            )
+
+    def get_recent_router_events(self, limit: int = 100) -> list[dict[str, object]]:
+        rows = self._get_conn().execute(
+            """
+            SELECT * FROM router_request_events
+            ORDER BY occurred_at DESC
+            LIMIT ?
+            """,
+            (max(1, limit),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_kind_breakdown(self, days: int = 7) -> dict[str, dict[str, int]]:
+        cutoff = time.time() - days * 86400
+        conn = self._get_conn()
+        request_rows = conn.execute(
+            """
+            SELECT request_kind, COUNT(*) AS count
+            FROM provider_request_events
+            WHERE occurred_at >= ?
+            GROUP BY request_kind
+            """,
+            (cutoff,),
+        ).fetchall()
+        response_rows = conn.execute(
+            """
+            SELECT response_kind, COUNT(*) AS count
+            FROM provider_request_events
+            WHERE occurred_at >= ?
+            GROUP BY response_kind
+            """,
+            (cutoff,),
+        ).fetchall()
+        return {
+            "request": {row["request_kind"]: int(row["count"]) for row in request_rows},
+            "response": {row["response_kind"]: int(row["count"]) for row in response_rows},
+        }
 
     def cancel_reservation(self, reservation_id: str | None) -> None:
         if not reservation_id:
@@ -598,6 +721,7 @@ class MetricsDB:
         with self.transaction(immediate=True) as conn:
             conn.execute("DELETE FROM provider_daily_metrics WHERE metric_date < ?", (cutoff_date,))
             conn.execute("DELETE FROM provider_request_events WHERE occurred_at < ?", (cutoff_ts,))
+            conn.execute("DELETE FROM router_request_events WHERE occurred_at < ?", (cutoff_ts,))
             conn.execute("DELETE FROM provider_quota_reservations WHERE expires_at <= ?", (now_ts,))
 
     def close(self) -> None:
