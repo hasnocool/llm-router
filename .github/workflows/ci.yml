@@ -20,6 +20,8 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - name: Repair fallback patch matcher
+        run: python scripts/fix_model_fallback_patch_harness.py
       - name: Apply model fallback resilience patch
         run: python scripts/apply_model_fallback_resilience.py
       - name: Install project and QA tools
