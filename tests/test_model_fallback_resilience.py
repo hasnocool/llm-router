@@ -107,6 +107,9 @@ async def test_404_falls_back_to_another_model_on_same_provider(tmp_path) -> Non
         assert groq.calls == ["groq-default", "groq-alt"]
         assert hf.calls == []
         assert router.status["groq"].consecutive_failures == 0
+        rows = await router._metrics_store.run_blocking(lambda db: db.get_model_task_metrics(days=30))
+        failed = [row for row in rows if row["provider_name"] == "groq" and row["model"] == "groq-default"]
+        assert failed and failed[0]["attempts"] >= 1 and failed[0]["successes"] == 0
         await router._metrics_store.close()
 
 
@@ -165,6 +168,29 @@ async def test_other_task_models_remain_in_fallback_catalog(tmp_path) -> None:
         await router._metrics_store.close()
 
 
+async def test_non_chat_discovery_models_are_not_fallback_candidates(tmp_path) -> None:
+    async with httpx.AsyncClient() as client:
+        router = ZeroCostModelRouter(_settings(tmp_path), client)
+        router._model_cache["groq"] = (
+            time.time(),
+            [
+                {"id": "groq-default"},
+                {"id": "chat-alt", "type": "chat"},
+                {"id": "text-embedding-3-small", "type": "embedding"},
+                {"id": "whisper-large-v3", "task": "transcription"},
+                {"id": "rerank-v3"},
+            ],
+        )
+
+        candidates = router._provider_model_candidates("groq", "groq-default", {})
+
+        assert "chat-alt" in candidates
+        assert "text-embedding-3-small" not in candidates
+        assert "whisper-large-v3" not in candidates
+        assert "rerank-v3" not in candidates
+        await router._metrics_store.close()
+
+
 async def test_provider_failure_counts_once_even_with_multiple_models(tmp_path) -> None:
     async with httpx.AsyncClient() as client:
         router = ZeroCostModelRouter(_settings(tmp_path), client)
@@ -220,4 +246,12 @@ async def test_stream_never_fails_over_after_emitting_data(tmp_path) -> None:
         assert any("partial" in line for line in seen)
         assert first.calls == 1
         assert second.calls == 0
+        assert router.status["groq"].consecutive_failures == 1
+        events = await router._metrics_store.run_blocking(lambda db: db.get_recent_router_events(limit=10))
+        assert any(
+            event["provider_name"] == "groq"
+            and event["model"] == "groq-default"
+            and event["success"] == 0
+            for event in events
+        )
         await router._metrics_store.close()

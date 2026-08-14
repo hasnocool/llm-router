@@ -169,6 +169,11 @@ class ZeroCostModelRouter(ModelRouter):
             if model_id and model_id not in candidates:
                 candidates.append(model_id)
 
+        def add_discovered(item: dict[str, object], key: str) -> None:
+            model_id = str(item.get(key) or "").strip()
+            if model_id and self._looks_chat_capable_model(model_id, item):
+                add(model_id)
+
         add(preferred)
         add(self.settings.provider(provider).default_model)
         for route in self.settings.models.values():
@@ -177,10 +182,32 @@ class ZeroCostModelRouter(ModelRouter):
         cached = self._model_cache.get(provider)
         if cached:
             for item in cached[1]:
-                add(item.get("id"))
+                add_discovered(item, "id")
         for item in catalog.get(provider, []):
-            add(item.get("model_id"))
+            add_discovered(item, "model_id")
         return candidates
+
+    @staticmethod
+    def _looks_chat_capable_model(model_id: str, metadata: dict[str, object]) -> bool:
+        descriptive = " ".join(
+            str(metadata.get(key) or "").lower()
+            for key in (
+                "type", "task", "pipeline_tag", "capability", "capabilities",
+                "modality", "modalities",
+            )
+        )
+        non_chat_terms = (
+            "embedding", "rerank", "speech", "transcription", "text-to-speech",
+            "text_to_speech", "moderation", "image-generation", "image_generation",
+        )
+        if any(term in descriptive for term in non_chat_terms):
+            return False
+
+        lowered = model_id.lower()
+        obvious_non_chat_markers = (
+            "embed", "rerank", "whisper", "tts", "moderation",
+        )
+        return not any(marker in lowered for marker in obvious_non_chat_markers)
 
     def _rank_model_alternatives(
         self,
@@ -359,13 +386,21 @@ class ZeroCostModelRouter(ModelRouter):
                 continue
             except ProviderUnavailable as exc:
                 errors.append(f"{name}/{model}: {exc}")
+                latency_ms = (time.perf_counter() - t0) * 1000
                 if exc.status_code != 413:
                     self._mark_retryable_failure(name, exc)
                     failed_providers.add(name)
+                else:
+                    await self._record_router_event(
+                        provider=name, model=model, stream=False, explicit=explicit,
+                        failover_index=idx, success=False, task_kind=profile.kind,
+                        request_kind=request_kind, latency_ms=latency_ms,
+                        status_code=exc.status_code, request_id=request_id,
+                    )
                 await self._record_message_log(
                     request_id=request_id, req=req, model=model, stream=False, explicit=explicit,
                     success=False, request_kind=request_kind, error=exc, provider=name,
-                    status_code=exc.status_code, latency_ms=(time.perf_counter() - t0) * 1000,
+                    status_code=exc.status_code, latency_ms=latency_ms,
                 )
                 await self._log_event(
                     level="warning",
@@ -379,10 +414,17 @@ class ZeroCostModelRouter(ModelRouter):
                 if explicit or exc.status_code != 404:
                     raise
                 errors.append(f"{name}/{model}: {exc}")
+                latency_ms = (time.perf_counter() - t0) * 1000
+                await self._record_router_event(
+                    provider=name, model=model, stream=False, explicit=explicit,
+                    failover_index=idx, success=False, task_kind=profile.kind,
+                    request_kind=request_kind, latency_ms=latency_ms,
+                    status_code=exc.status_code, request_id=request_id,
+                )
                 await self._record_message_log(
                     request_id=request_id, req=req, model=model, stream=False, explicit=explicit,
                     success=False, request_kind=request_kind, error=exc, provider=name,
-                    status_code=exc.status_code, latency_ms=(time.perf_counter() - t0) * 1000,
+                    status_code=exc.status_code, latency_ms=latency_ms,
                 )
                 await self._log_event(
                     level="error",
@@ -536,16 +578,42 @@ class ZeroCostModelRouter(ModelRouter):
                 )
                 continue
             except ProviderUnavailable as exc:
+                latency_ms = (time.perf_counter() - t0) * 1000
                 if emitted:
+                    self._mark_retryable_failure(name, exc)
+                    await self._record_router_event(
+                        provider=name, model=model, stream=True, explicit=explicit,
+                        failover_index=idx, success=False, task_kind=profile.kind,
+                        request_kind=request_kind, latency_ms=latency_ms,
+                        status_code=exc.status_code, request_id=request_id,
+                    )
+                    await self._record_message_log(
+                        request_id=request_id, req=req, model=model, stream=True, explicit=explicit,
+                        success=False, request_kind=request_kind, error=exc, provider=name,
+                        status_code=exc.status_code, latency_ms=latency_ms,
+                    )
+                    await self._log_event(
+                        level="warning", source="router",
+                        message=f"provider {name} stream failed after output: {exc}",
+                        provider=name, model=model, request_id=request_id,
+                        details={"status_code": exc.status_code, "partial_response": True},
+                    )
                     raise
                 errors.append(f"{name}/{model}: {exc}")
                 if exc.status_code != 413:
                     self._mark_retryable_failure(name, exc)
                     failed_providers.add(name)
+                else:
+                    await self._record_router_event(
+                        provider=name, model=model, stream=True, explicit=explicit,
+                        failover_index=idx, success=False, task_kind=profile.kind,
+                        request_kind=request_kind, latency_ms=latency_ms,
+                        status_code=exc.status_code, request_id=request_id,
+                    )
                 await self._record_message_log(
                     request_id=request_id, req=req, model=model, stream=True, explicit=explicit,
                     success=False, request_kind=request_kind, error=exc, provider=name,
-                    status_code=exc.status_code, latency_ms=(time.perf_counter() - t0) * 1000,
+                    status_code=exc.status_code, latency_ms=latency_ms,
                 )
                 await self._log_event(
                     level="warning",
@@ -559,10 +627,17 @@ class ZeroCostModelRouter(ModelRouter):
                 if emitted or explicit or exc.status_code != 404:
                     raise
                 errors.append(f"{name}/{model}: {exc}")
+                latency_ms = (time.perf_counter() - t0) * 1000
+                await self._record_router_event(
+                    provider=name, model=model, stream=True, explicit=explicit,
+                    failover_index=idx, success=False, task_kind=profile.kind,
+                    request_kind=request_kind, latency_ms=latency_ms,
+                    status_code=exc.status_code, request_id=request_id,
+                )
                 await self._record_message_log(
                     request_id=request_id, req=req, model=model, stream=True, explicit=explicit,
                     success=False, request_kind=request_kind, error=exc, provider=name,
-                    status_code=exc.status_code, latency_ms=(time.perf_counter() - t0) * 1000,
+                    status_code=exc.status_code, latency_ms=latency_ms,
                 )
                 await self._log_event(
                     level="error",
