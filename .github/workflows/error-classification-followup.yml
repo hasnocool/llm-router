@@ -1,0 +1,46 @@
+name: Error classification follow-up
+
+on:
+  push:
+    branches:
+      - agent/error-classification-learning
+
+permissions:
+  contents: write
+
+jobs:
+  validate-followup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/error-classification-learning
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply follow-up
+        run: python scripts/fix_zero_cost_error_classification.py
+      - name: Install project and QA tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-asyncio ruff pyright
+      - name: Compile
+        run: python -m compileall -q src tests
+      - name: Ruff critical checks
+        run: ruff check src tests --select E9,F63,F7,F82
+      - name: Tests
+        run: pytest -q
+      - name: Pyright
+        run: pyright src
+      - name: Commit verified follow-up
+        run: |
+          rm scripts/fix_zero_cost_error_classification.py
+          rm .github/workflows/error-classification-followup.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: align zero-cost error classifications"
+          git push origin HEAD:agent/error-classification-learning
