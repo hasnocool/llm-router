@@ -9,6 +9,7 @@ let charts = {};
 let loadVersion = 0;
 let timer = null;
 let activeRequest = null;
+let refreshInFlight = false;
 let toastTimer = null;
 
 const fmt = (value) => value == null ? "N/A" : Number(value).toLocaleString();
@@ -52,33 +53,49 @@ function setLoading(isLoading) {
   button.textContent = isLoading ? "Refreshing…" : "Refresh";
 }
 
-async function load({ notify = false } = {}) {
+async function load({ notify = false, force = false } = {}) {
+  // Automatic refreshes never cancel one another. If the API is slower than
+  // the refresh interval, let the current request finish and render it rather
+  // than creating an endless abort/retry loop. User-triggered refreshes may
+  // explicitly replace the in-flight request.
+  if (refreshInFlight && !force) return;
+  if (force && activeRequest) activeRequest.abort();
+
   const version = ++loadVersion;
   const days = document.getElementById("days").value;
-  if (activeRequest) activeRequest.abort();
-  activeRequest = new AbortController();
+  const controller = new AbortController();
+  activeRequest = controller;
+  refreshInFlight = true;
   setLoading(true);
-  setConnection("loading", "refreshing");
+  if (!state) setConnection("loading", "refreshing");
 
   try {
     const resp = await fetch(`/dashboard/api?days=${encodeURIComponent(days)}`, {
-      signal: activeRequest.signal,
-      headers: { "Accept": "application/json" },
+      signal: controller.signal,
+      cache: "no-store",
+      headers: {
+        "Accept": "application/json",
+        "Cache-Control": "no-cache",
+      },
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const nextState = await resp.json();
     if (version !== loadVersion) return;
     state = nextState;
     render();
-    setConnection("fresh", "connected");
+    setConnection("fresh", "live");
     document.getElementById("updated").textContent = `updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
     if (notify) showToast("Dashboard refreshed");
   } catch (err) {
     if (err.name === "AbortError" || version !== loadVersion) return;
-    setConnection("stale", "API unavailable");
+    setConnection("stale", navigator.onLine ? "API unavailable" : "offline");
     if (notify) showToast(`Refresh failed: ${err.message}`, "error");
   } finally {
-    if (version === loadVersion) setLoading(false);
+    if (activeRequest === controller) {
+      activeRequest = null;
+      refreshInFlight = false;
+      if (version === loadVersion) setLoading(false);
+    }
   }
 }
 
@@ -176,7 +193,14 @@ function chartOptions(extra = {}) {
 function makeChart(canvasId, type, labels, datasets, extra = {}) {
   const canvas = document.getElementById(canvasId);
   if (!canvas || typeof Chart === "undefined") return;
-  if (charts[canvasId]) charts[canvasId].destroy();
+  if (charts[canvasId]) {
+    const chart = charts[canvasId];
+    chart.data.labels = labels;
+    chart.data.datasets = datasets;
+    chart.options = chartOptions(extra);
+    chart.update("none");
+    return;
+  }
   charts[canvasId] = new Chart(canvas, {
     type,
     data: { labels, datasets },
@@ -486,11 +510,19 @@ function renderEvents() {
 }
 
 function startRefresh() {
-  if (!timer) timer = setInterval(() => load(), REFRESH_MS);
+  if (timer) return;
+  const tick = async () => {
+    timer = null;
+    if (!document.hidden) await load();
+    if (document.getElementById("autorefresh").checked) {
+      timer = setTimeout(tick, REFRESH_MS);
+    }
+  };
+  timer = setTimeout(tick, REFRESH_MS);
 }
 
 function stopRefresh() {
-  if (timer) clearInterval(timer);
+  if (timer) clearTimeout(timer);
   timer = null;
 }
 
@@ -506,18 +538,29 @@ function setupNavigation() {
   for (const section of sections) observer.observe(section);
 }
 
-document.getElementById("days").addEventListener("change", () => load({ notify: true }));
-document.getElementById("refresh-now").addEventListener("click", () => load({ notify: true }));
+document.getElementById("days").addEventListener("change", () => load({ notify: true, force: true }));
+document.getElementById("refresh-now").addEventListener("click", () => load({ notify: true, force: true }));
 document.getElementById("autorefresh").addEventListener("change", (event) => {
   if (event.target.checked) {
     startRefresh();
-    load({ notify: true });
+    load({ notify: true, force: true });
   } else {
     stopRefresh();
     showToast("Live refresh paused");
   }
 });
 
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && document.getElementById("autorefresh").checked) {
+    load({ force: true });
+    startRefresh();
+  }
+});
+window.addEventListener("online", () => {
+  if (document.getElementById("autorefresh").checked) load({ force: true });
+});
+window.addEventListener("offline", () => setConnection("stale", "offline"));
+
 setupNavigation();
-load();
+load({ force: true });
 startRefresh();
