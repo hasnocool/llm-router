@@ -8,6 +8,11 @@
 - Treated HTTP 413 (payload too large) as retryable so zero-cost routing fails over to the next provider whose context window fits the request.
 - Sanitized Gemini function-declaration schemas so OpenAI-compatible clients' JSON-Schema keywords (`$schema`, `title`, `const`, `additionalProperties`, ...) no longer break tool calls.
 - Scoped forwarded-request headers to the request lifetime so streaming and non-streaming paths reset the context correctly.
+- Restored automatic-routing eligibility filtering and bare provider-ID resolution so blocked providers are skipped and explicit provider selections use their configured default model.
+- Restricted cross-provider client-error failover to model-not-found responses instead of replaying non-retryable 4xx requests across the routing pool.
+- Protected dashboard, logs, and analytics endpoints with `ROUTER_API_KEY` whenever API authentication is configured.
+- Made full request/response body logging opt-in and preserved unknown provider model limits as `NULL` instead of treating unknown capacity as zero.
+- Excluded model-discovery probes from chat reliability analytics and added retention for routing-decision events.
 - Removed quota-burning 60-second provider model polling from daemon background work.
 - Made provider/matrix/metrics status endpoints passive and cache-backed.
 - Moved runtime SQLite/report I/O off the asyncio event loop through a serialized metrics worker.
