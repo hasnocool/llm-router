@@ -196,7 +196,7 @@ class ModelRouter:
         record_fn = getattr(logging, level.lower(), None)
         try:
             if callable(record_fn):
-                extra = {"source": source}
+                extra: dict[str, object] = {"source": source}
                 if details:
                     extra["details"] = details
                 record_fn("%s", message, extra=extra)
@@ -761,6 +761,7 @@ class ModelRouter:
             for name in pool:
                 if name == "local" or not self.settings.provider(name).default_model:
                     continue
+                seen.add(name)
                 out.append(ModelInfo(id=name, owned_by="router"))
             for alias, route in self.settings.models.items():
                 if route.provider not in pool or alias in seen:
@@ -855,6 +856,28 @@ class ModelRouter:
         return pricing.input_cost_per_1m_tokens, pricing.output_cost_per_1m_tokens
 
     @staticmethod
+    def _as_int(value: object, default: int = 0) -> int:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float, str)):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+        return default
+
+    @staticmethod
+    def _as_float(value: object, default: float = 0.0) -> float:
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float, str)):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+        return default
+
+    @staticmethod
     def _estimate_cost(prompt_tokens: int, completion_tokens: int, input_rate: float, output_rate: float) -> float:
         return (max(0, prompt_tokens) / 1_000_000.0) * max(0.0, input_rate) + (
             max(0, completion_tokens) / 1_000_000.0
@@ -869,8 +892,8 @@ class ModelRouter:
         )
         task_breakdown = await self._metrics_store.get_task_breakdown(days)
 
-        provider_rows = {row.get("provider_name") or "": row for row in provider_attempts}
-        router_rows = {row.get("provider_name") or "": row for row in router_attempts}
+        provider_rows = {str(row.get("provider_name") or ""): row for row in provider_attempts}
+        router_rows = {str(row.get("provider_name") or ""): row for row in router_attempts}
         provider_names = sorted(
             {name for name in self.providers} | {name for name in provider_rows if name} | {name for name in router_rows if name}
         )
@@ -891,17 +914,17 @@ class ModelRouter:
         for name in provider_names:
             attempt = provider_rows.get(name, {})
             route = router_rows.get(name, {})
-            attempts = int(attempt.get("attempts") or 0)
-            successes = int(attempt.get("successes") or 0)
-            failures = int(attempt.get("failures") or max(0, attempts - successes))
-            failovers = int(route.get("failovers") or 0)
-            prompt_tokens = int(attempt.get("prompt_tokens") or 0)
-            completion_tokens = int(attempt.get("completion_tokens") or 0)
-            summed_tokens = int(attempt.get("total_tokens") or 0)
-            avg_latency_ms = float(attempt.get("avg_latency_ms") or 0.0)
-            streams = int(route.get("streams") or 0)
-            explicit_requests = int(route.get("explicit_requests") or 0)
-            route_requests = int(route.get("requests") or 0)
+            attempts = self._as_int(attempt.get("attempts"))
+            successes = self._as_int(attempt.get("successes"))
+            failures = self._as_int(attempt.get("failures"), max(0, attempts - successes))
+            failovers = self._as_int(route.get("failovers"))
+            prompt_tokens = self._as_int(attempt.get("prompt_tokens"))
+            completion_tokens = self._as_int(attempt.get("completion_tokens"))
+            summed_tokens = self._as_int(attempt.get("total_tokens"))
+            avg_latency_ms = self._as_float(attempt.get("avg_latency_ms"))
+            streams = self._as_int(route.get("streams"))
+            explicit_requests = self._as_int(route.get("explicit_requests"))
+            route_requests = self._as_int(route.get("requests"))
             input_rate, output_rate = self._pricing_for_provider(name)
             estimated_cost = self._estimate_cost(prompt_tokens, completion_tokens, input_rate, output_rate)
             success_rate = (successes / attempts) if attempts else None
@@ -966,7 +989,7 @@ class ModelRouter:
                     "message": f"{name} failover rate is {failover_rate:.0%}",
                 })
 
-        overall_failover_rate = (total_failovers / max(1, sum(int(row.get("requests") or 0) for row in router_attempts)))
+        overall_failover_rate = (total_failovers / max(1, sum(self._as_int(row.get("requests")) for row in router_attempts)))
         overall_success_rate = (total_successes / total_attempts) if total_attempts else None
         overall_failure_rate = (total_failures / total_attempts) if total_attempts else None
         error_levels = app_breakdown.get("levels", {})
@@ -1100,8 +1123,8 @@ class ModelRouter:
         total_calls = 0
         total_failed = 0
         total_tokens = 0
-        total_calls_remaining = 0
-        total_tokens_remaining = 0
+        total_calls_remaining: int | None = None
+        total_tokens_remaining: int | None = None
         rate_limit_warnings = 0
         for idx, name in enumerate(self.providers):
             status = self.status[name]
@@ -1129,9 +1152,9 @@ class ModelRouter:
             total_failed += calls_failed
             total_tokens += tokens_used
             if calls_remaining is not None:
-                total_calls_remaining += calls_remaining
+                total_calls_remaining = (total_calls_remaining or 0) + calls_remaining
             if tokens_remaining is not None:
-                total_tokens_remaining += tokens_remaining
+                total_tokens_remaining = (total_tokens_remaining or 0) + tokens_remaining
             if status.rate_limit_remaining == 0:
                 rate_limit_warnings += 1
             providers[name] = {

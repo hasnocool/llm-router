@@ -14,7 +14,7 @@ def test_classify_request_kind():
     assert classify_request_kind({"messages": []}) == "chat"
     assert classify_request_kind({"tools": [{"type": "function"}]}) == "tool_call"
     assert classify_request_kind({"tool_choice": "auto"}) == "tool_call"
-    assert classify_request_kind({"tools": [], "tool_choice": "none"}) == "tool_call"
+    assert classify_request_kind({"tools": [], "tool_choice": "none"}) == "chat"
 
 
 def test_classify_response_kind():

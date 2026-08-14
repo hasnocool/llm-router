@@ -78,7 +78,8 @@ class ZeroCostModelRouter(ModelRouter):
             pool = self._routing_pool()
             scores = [
                 score for score in self.route_scores()
-                if score.provider in pool
+                if score.eligible
+                and score.provider in pool
                 and self.settings.provider(score.provider).default_model
             ]
             scores = self._apply_task_profile(scores, profile)
@@ -160,7 +161,8 @@ class ZeroCostModelRouter(ModelRouter):
             pool = self._routing_pool()
             scores = [
                 score for score in self.route_scores()
-                if score.provider in pool
+                if score.eligible
+                and score.provider in pool
                 and self.settings.provider(score.provider).default_model
             ]
             scores = self._apply_task_profile(scores, profile)
@@ -275,7 +277,7 @@ class ZeroCostModelRouter(ModelRouter):
                 )
                 continue
             except ProviderRequestError as exc:
-                if len(order) == 1:
+                if explicit or exc.status_code != 404:
                     raise
                 errors.append(f"{name}: {exc}")
                 self._mark_provider_failure(name, exc)
@@ -445,7 +447,7 @@ class ZeroCostModelRouter(ModelRouter):
                 )
                 continue
             except ProviderRequestError as exc:
-                if len(order) == 1:
+                if explicit or exc.status_code != 404:
                     raise
                 errors.append(f"{name}: {exc}")
                 self._mark_provider_failure(name, exc)

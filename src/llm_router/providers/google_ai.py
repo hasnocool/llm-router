@@ -207,10 +207,11 @@ class GoogleAIProvider(Provider):
                 if key not in allowed or value is None:
                     continue
                 if key == "properties":
+                    if not isinstance(value, dict):
+                        continue
                     cleaned[key] = {
                         name: GoogleAIProvider._sanitize_schema(sub)
                         for name, sub in value.items()
-                        if isinstance(value, dict)
                     }
                 else:
                     cleaned[key] = GoogleAIProvider._sanitize_schema(value)

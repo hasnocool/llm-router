@@ -85,7 +85,8 @@ app.mount(
 
 @app.middleware("http")
 async def optional_router_auth(request: Request, call_next):
-    if _settings is not None and _settings.router_api_key and request.url.path.startswith("/v1/"):
+    protected = request.url.path.startswith(("/v1/", "/dashboard", "/logs", "/analytics"))
+    if _settings is not None and _settings.router_api_key and protected:
         bearer = request.headers.get("authorization", "")
         supplied = bearer.removeprefix("Bearer ").strip() or request.headers.get("x-api-key", "")
         if not supplied or not hmac.compare_digest(supplied, _settings.router_api_key):

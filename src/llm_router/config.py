@@ -119,6 +119,9 @@ class Settings:
             pname = normalize_provider(provider_hint)
             if pname in self.providers:
                 return pname, (rest or self.provider(pname).default_model)
+        provider_name = normalize_provider(model)
+        if provider_name in self.providers:
+            return provider_name, self.provider(provider_name).default_model
         route = self.models.get(model)
         if route is not None:
             return route.provider, route.model
@@ -212,7 +215,7 @@ def load_settings(
 
     logs_raw = raw.get("logs", {})
     logs = LogsConfig(
-        level=resolved_env.get("LLM_ROUTER_LOG_LEVEL", logs_raw.get("level", "INFO")),
+        level=str(resolved_env.get("LLM_ROUTER_LOG_LEVEL") or logs_raw.get("level", "INFO") or "INFO"),
         file_path=logs_raw.get("file_path"),
         max_bytes=logs_raw.get("max_bytes", 10 * 1024 * 1024),
         backup_count=logs_raw.get("backup_count", 5),

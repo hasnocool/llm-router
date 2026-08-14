@@ -94,7 +94,10 @@ def estimate_request_tokens(payload: dict[str, Any]) -> int:
 
 
 def classify_request_kind(payload: dict[str, Any]) -> str:
-    if payload.get("tools") or payload.get("tool_choice"):
+    tool_choice = payload.get("tool_choice")
+    if tool_choice == "none":
+        return "chat"
+    if payload.get("tools") or tool_choice:
         return "tool_call"
     return "chat"
 
