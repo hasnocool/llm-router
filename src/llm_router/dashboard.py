@@ -34,7 +34,14 @@ async def dashboard_api(
 ) -> JSONResponse:
     from .main import get_router
     data = await get_router().get_dashboard_data(days=days, events=events)
-    return JSONResponse(content=data)
+    return JSONResponse(
+        content=data,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @router.get("/analytics/api")

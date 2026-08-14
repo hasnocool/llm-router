@@ -67,14 +67,25 @@ def test_dashboard_shell_keeps_render_contract_ids() -> None:
     assert required <= set(parser.ids)
 
 
-def test_dashboard_client_uses_abortable_refresh_and_provider_recovery_fields() -> None:
+def test_dashboard_client_uses_non_overlapping_live_refresh_and_provider_recovery_fields() -> None:
     script = (STATIC / "dashboard.js").read_text(encoding="utf-8")
     assert "AbortController" in script
+    assert "refreshInFlight && !force" in script
     assert "activeRequest.abort()" in script
+    assert 'cache: "no-store"' in script
+    assert 'chart.update("none")' in script
+    assert 'document.addEventListener("visibilitychange"' in script
+    assert "document.hidden" in script
     assert "IntersectionObserver" in script
     assert "provider.in_backoff" in script
     assert "provider.consecutive_failures" in script
     assert "/dashboard/api?days=" in script
+
+
+def test_dashboard_api_disables_http_caching() -> None:
+    source = (STATIC.parent / "dashboard.py").read_text(encoding="utf-8")
+    assert '"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"' in source
+    assert '"Pragma": "no-cache"' in source
 
 
 def test_dashboard_styles_include_responsive_and_reduced_motion_layouts() -> None:
