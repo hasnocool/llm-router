@@ -125,18 +125,20 @@ def test_zero_cost_score_retries_provider_after_backoff_expires() -> None:
 
 
 @pytest.mark.asyncio
-async def test_zero_cost_retryable_failure_uses_shared_threshold() -> None:
+async def test_zero_cost_retryable_failure_uses_soft_threshold() -> None:
     async with httpx.AsyncClient() as client:
         router = ZeroCostModelRouter(_settings(strategy="zero-cost"), client)
         status = router.status["groq"]
         status.available = True
         error = ProviderUnavailable("upstream 503", status_code=503)
 
-        with patch("llm_router.router.time.time", return_value=1000.0):
-            router._mark_retryable_failure("groq", error)
-            router._mark_retryable_failure("groq", error)
+        with patch("llm_router.zero_cost_router.time.time", return_value=1000.0):
+            for _ in range(4):
+                router._mark_retryable_failure("groq", error)
             assert status.available is True
+            assert status.backoff_until == 0.0
             router._mark_retryable_failure("groq", error)
 
         assert status.available is False
-        assert status.consecutive_failures == 3
+        assert status.consecutive_failures == 5
+        assert status.backoff_until == 1120.0
