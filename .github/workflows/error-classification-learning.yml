@@ -21,7 +21,9 @@ jobs:
         with:
           python-version: '3.12'
       - name: Apply implementation
-        run: python scripts/apply_error_classification_learning.py
+        run: |
+          python scripts/apply_error_classification_learning.py
+          python scripts/fix_error_classification_tests.py
       - name: Install project and QA tools
         run: |
           python -m pip install --upgrade pip
@@ -38,6 +40,7 @@ jobs:
       - name: Commit verified implementation
         run: |
           rm scripts/apply_error_classification_learning.py
+          rm scripts/fix_error_classification_tests.py
           rm .github/workflows/error-classification-learning.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
