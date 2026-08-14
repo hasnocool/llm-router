@@ -26,6 +26,10 @@
 - Normalized Gemini streaming responses to OpenAI `chat.completion.chunk` SSE and recorded streaming usage.
 - Recorded retryable and HTTP provider failures in metrics instead of counting only successful responses.
 
+### Changed
+
+- Completely redesigned the web dashboard into a responsive routing control center with persistent section navigation, grouped operational metrics, provider health cards, clearer routing/analytics workspaces, a streamlined activity view, manual/live refresh controls, and overlap-safe API refreshes.
+
 ### Added
 
 - Web dashboard (`GET /dashboard`) with auto-refreshing summary cards, per-provider usage bars, routing matrix, model list, request-kind breakdown, traffic charts, and recent routing events, plus an aggregated `GET /dashboard/api` endpoint (Chart.js vendored locally for offline use).
