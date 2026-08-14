@@ -23,6 +23,7 @@ from .providers.base import (
     ProviderRequestError,
     ProviderUnavailable,
     QuotaExceededError,
+    classify_provider_error,
     classify_request_kind,
     classify_response_kind,
 )
@@ -54,6 +55,7 @@ class ProviderStatus:
     latency_p99_ms: float = 0.0
     consecutive_failures: int = 0
     backoff_until: float = 0.0
+    last_error_class: str = ""
 
 
 class ModelRouter:
@@ -306,12 +308,16 @@ class ModelRouter:
         status.backoff_until = 0.0
         status.latency_ms = latency_ms
         status.last_error = ""
+        status.last_error_class = ""
         status.last_polled = time.time()
 
     def _mark_provider_failure(self, name: str, exc: BaseException) -> None:
         status = self.status[name]
         now = time.time()
         status.last_error = str(exc)[:200]
+        status.last_error_class = getattr(exc, "error_class", "") or classify_provider_error(
+            getattr(exc, "status_code", None)
+        )
         status.last_polled = now
         status.consecutive_failures += 1
 
@@ -503,8 +509,9 @@ class ModelRouter:
         max_chars = self.settings.logs.max_body_chars
         error_json = ""
         try:
-            if isinstance(error, ProviderRequestError) and error.body:
-                error_json = error.body[:max_chars]
+            body = getattr(error, "body", "") if error is not None else ""
+            if body:
+                error_json = str(body)[:max_chars]
         except AttributeError:
             pass
         try:
@@ -1205,6 +1212,11 @@ class ModelRouter:
         )
         kind_breakdown = await self._metrics_store.get_kind_breakdown(days)
         recent_events = await self._metrics_store.get_recent_router_events(events)
+        for event in recent_events:
+            if not event.get("success"):
+                event["error_class"] = classify_provider_error(
+                    self._as_int(event.get("status_code"), default=0) or None
+                )
         analytics = await self.get_analytics_data(days=max(1, days))
         models = await self.list_models()
 
@@ -1251,6 +1263,7 @@ class ModelRouter:
                 "available": status.available,
                 "model_count": status.model_count,
                 "last_error": status.last_error,
+                "last_error_class": status.last_error_class,
                 "last_polled": status.last_polled,
                 "daily_calls_used": calls_used,
                 "daily_calls_failed": calls_failed,

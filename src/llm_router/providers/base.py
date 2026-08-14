@@ -21,6 +21,56 @@ from ..rate_limits import RateLimitParser, extract_usage_from_response, retry_af
 # Anything else (400/401/403/404/422) is a client error and never triggers failover.
 RETRYABLE_STATUSES = {402, 413, 429, 500, 502, 503, 504}
 
+ERROR_REQUEST_INCOMPATIBLE = "request_incompatible"
+ERROR_AUTHENTICATION = "authentication"
+ERROR_BILLING_OR_QUOTA = "billing_or_quota"
+ERROR_MODEL_UNAVAILABLE = "model_unavailable"
+ERROR_CONTEXT_LIMIT = "context_limit"
+ERROR_RATE_LIMITED = "rate_limited"
+ERROR_PROVIDER_UNAVAILABLE = "provider_unavailable"
+ERROR_REQUEST_ERROR = "request_error"
+
+
+def classify_provider_error(status_code: int | None) -> str:
+    if status_code is None:
+        return ERROR_PROVIDER_UNAVAILABLE
+    if status_code in {400, 422}:
+        return ERROR_REQUEST_INCOMPATIBLE
+    if status_code in {401, 403}:
+        return ERROR_AUTHENTICATION
+    if status_code == 402:
+        return ERROR_BILLING_OR_QUOTA
+    if status_code == 404:
+        return ERROR_MODEL_UNAVAILABLE
+    if status_code == 413:
+        return ERROR_CONTEXT_LIMIT
+    if status_code == 429:
+        return ERROR_RATE_LIMITED
+    if 500 <= status_code <= 599:
+        return ERROR_PROVIDER_UNAVAILABLE
+    return ERROR_REQUEST_ERROR
+
+
+def upstream_error_detail(body: str, max_chars: int = 400) -> str:
+    if not body:
+        return ""
+    detail = ""
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        data = None
+    if isinstance(data, dict):
+        error = data.get("error")
+        if isinstance(error, dict):
+            detail = str(error.get("message") or error.get("detail") or "")
+        elif isinstance(error, str):
+            detail = error
+        if not detail:
+            detail = str(data.get("message") or data.get("detail") or "")
+    if not detail:
+        detail = " ".join(body.split())
+    return detail[:max_chars]
+
 FORWARDED_REQUEST_HEADERS: ContextVar[dict[str, str]] = ContextVar(
     "forwarded_request_headers", default={}
 )
@@ -59,22 +109,37 @@ class ProviderUnavailable(Exception):
         message: str,
         status_code: int | None = None,
         retry_after_until: int | None = None,
+        *,
+        body: str = "",
+        error_class: str = "",
     ):
         super().__init__(message)
         self.status_code = status_code
         self.retry_after_until = retry_after_until
+        self.body = body
+        self.error_class = error_class or classify_provider_error(status_code)
 
 
 class ProviderRequestError(Exception):
-    def __init__(self, message: str, status_code: int | None = None, body: str = ""):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        body: str = "",
+        *,
+        error_class: str = "",
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+        self.error_class = error_class or classify_provider_error(status_code)
 
 
 class QuotaExceededError(ProviderRequestError):
     def __init__(self, message: str, provider: str):
-        super().__init__(message, status_code=429)
+        super().__init__(
+            message, status_code=429, error_class=ERROR_BILLING_OR_QUOTA
+        )
         self.provider = provider
 
 
@@ -138,23 +203,32 @@ class Provider:
         return f"{self.config.base_url}/{path.lstrip('/')}"
 
     async def _check_status(self, resp: httpx.Response) -> None:
+        if resp.status_code < 400:
+            return
+        try:
+            await resp.aread()
+            body = resp.text[:2000]
+        except (httpx.HTTPError, httpx.StreamError, UnicodeError):
+            body = ""
+        error_class = classify_provider_error(resp.status_code)
+        detail = upstream_error_detail(body)
+        message = f"{self.name} returned HTTP {resp.status_code}"
+        if detail:
+            message += f": {detail}"
         if resp.status_code in RETRYABLE_STATUSES:
             raise ProviderUnavailable(
-                f"{self.name} returned HTTP {resp.status_code}",
+                message,
                 status_code=resp.status_code,
                 retry_after_until=retry_after_timestamp(resp.headers),
-            )
-        if resp.status_code >= 400:
-            try:
-                await resp.aread()
-                body = resp.text[:2000]
-            except (httpx.HTTPError, httpx.StreamError, UnicodeError):
-                body = ""
-            raise ProviderRequestError(
-                f"{self.name} returned HTTP {resp.status_code}",
-                status_code=resp.status_code,
                 body=body,
+                error_class=error_class,
             )
+        raise ProviderRequestError(
+            message,
+            status_code=resp.status_code,
+            body=body,
+            error_class=error_class,
+        )
 
     async def _reserve_quota(self, payload: dict[str, Any]) -> str | None:
         if self._metrics_store is None:

@@ -307,6 +307,7 @@ function renderProviders() {
     mini("p50", ms(provider.latency_p50_ms));
     mini("p99", ms(provider.latency_p99_ms));
     mini("Failures", fmt(provider.consecutive_failures || 0));
+    mini("Error class", provider.last_error_class || "none");
 
     const quotas = card.appendChild(el("div", "quota-group"));
     quotas.appendChild(quotaRow("Calls", provider.daily_calls_used, provider.daily_calls_remaining));
@@ -500,7 +501,7 @@ function renderEvents() {
     if (event.stream) mode.appendChild(document.createTextNode(" stream"));
 
     const result = tr.appendChild(el("td"));
-    result.appendChild(el("span", `tag ${event.success ? "ok" : "err"}`, event.success ? (event.response_kind || "ok") : "failed"));
+    result.appendChild(el("span", `tag ${event.success ? "ok" : "err"}`, event.success ? (event.response_kind || "ok") : (event.error_class || "failed")));
     if (Number(event.failover_index || 0) > 0) result.appendChild(document.createTextNode(` · failover ${event.failover_index}`));
 
     tr.appendChild(el("td", null, fmt(event.total_tokens)));
