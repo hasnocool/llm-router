@@ -6,5 +6,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+*.log
+logs/
 metrics.db
+metrics.db-shm
+metrics.db-wal
 metrics_report.md

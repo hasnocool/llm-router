@@ -54,7 +54,8 @@ class AsyncMetricsStore:
         completion_tokens: int = 0,
         latency_ms: float = 0.0,
         status_code: int | None = None,
-        request_kind: str = "inference",
+        request_kind: str = "chat",
+        response_kind: str = "",
     ) -> None:
         await self._call(
             lambda db: db.reconcile_reservation(
@@ -66,8 +67,176 @@ class AsyncMetricsStore:
                 latency_ms,
                 status_code,
                 request_kind,
+                response_kind,
             )
         )
+
+    async def record_router_event(
+        self,
+        provider: str | None,
+        model: str,
+        stream: bool,
+        explicit: bool,
+        failover_index: int,
+        success: bool,
+        task_kind: str = "general",
+        request_kind: str = "chat",
+        response_kind: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: float = 0.0,
+        status_code: int | None = None,
+        occurred_at: float | None = None,
+        request_id: str = "",
+    ) -> None:
+        await self._call(
+            lambda db: db.record_router_event(
+                provider=provider,
+                model=model,
+                stream=stream,
+                explicit=explicit,
+                failover_index=failover_index,
+                success=success,
+                task_kind=task_kind,
+                request_kind=request_kind,
+                response_kind=response_kind,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=latency_ms,
+                status_code=status_code,
+                occurred_at=occurred_at,
+                request_id=request_id,
+            )
+        )
+
+    async def get_recent_router_events(self, limit: int = 100):
+        return await self._call(lambda db: db.get_recent_router_events(limit))
+
+    async def get_provider_attempt_metrics(self, days: int = 7):
+        return await self._call(lambda db: db.get_provider_attempt_metrics(days))
+
+    async def get_router_attempt_metrics(self, days: int = 7):
+        return await self._call(lambda db: db.get_router_attempt_metrics(days))
+
+    async def get_request_timeline(self, days: int = 30):
+        return await self._call(lambda db: db.get_request_timeline(days))
+
+    async def get_task_breakdown(self, days: int = 30):
+        return await self._call(lambda db: db.get_task_breakdown(days))
+
+    async def record_app_event(
+        self,
+        *,
+        level: str,
+        source: str,
+        message: str,
+        provider: str | None = None,
+        model: str | None = None,
+        request_id: str = "",
+        details: dict[str, object] | None = None,
+        occurred_at: float | None = None,
+    ) -> None:
+        await self._call(
+            lambda db: db.record_app_event(
+                level=level,
+                source=source,
+                message=message,
+                provider=provider,
+                model=model,
+                request_id=request_id,
+                details=details,
+                occurred_at=occurred_at,
+            )
+        )
+
+    async def get_app_events(
+        self,
+        limit: int = 200,
+        *,
+        level: str | None = None,
+        provider: str | None = None,
+        request_id: str | None = None,
+        since: float | None = None,
+        levels: tuple[str, ...] = (),
+    ):
+        return await self._call(
+            lambda db: db.get_app_events(
+                limit,
+                level=level,
+                provider=provider,
+                request_id=request_id,
+                since=since,
+                levels=levels,
+            )
+        )
+
+    async def record_message_log(
+        self,
+        *,
+        request_id: str = "",
+        provider: str | None,
+        model: str,
+        stream: bool,
+        explicit: bool,
+        success: bool,
+        request_kind: str = "chat",
+        response_kind: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: float = 0.0,
+        status_code: int | None = None,
+        request_json: str = "",
+        response_json: str = "",
+        error_json: str = "",
+        occurred_at: float | None = None,
+    ) -> None:
+        await self._call(
+            lambda db: db.record_message_log(
+                request_id=request_id,
+                provider=provider,
+                model=model,
+                stream=stream,
+                explicit=explicit,
+                success=success,
+                request_kind=request_kind,
+                response_kind=response_kind,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=latency_ms,
+                status_code=status_code,
+                request_json=request_json,
+                response_json=response_json,
+                error_json=error_json,
+                occurred_at=occurred_at,
+            )
+        )
+
+    async def get_message_logs(
+        self,
+        limit: int = 200,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        request_id: str | None = None,
+        since: float | None = None,
+        success: bool | None = None,
+    ):
+        return await self._call(
+            lambda db: db.get_message_logs(
+                limit,
+                provider=provider,
+                model=model,
+                request_id=request_id,
+                since=since,
+                success=success,
+            )
+        )
+
+    async def get_kind_breakdown(self, days: int = 7):
+        return await self._call(lambda db: db.get_kind_breakdown(days))
+
+    async def get_app_event_breakdown(self, days: int = 7):
+        return await self._call(lambda db: db.get_app_event_breakdown(days))
 
     async def cancel_reservation(self, reservation_id: str | None) -> None:
         await self._call(lambda db: db.cancel_reservation(reservation_id))

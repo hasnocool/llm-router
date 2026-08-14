@@ -1,6 +1,6 @@
 # llm-router
 
-OpenAI-compatible LLM router that bridges **multiple cloud providers** (HuggingFace, NVIDIA NIM, Cerebras, Groq, Google AI) with **local self-hosted models** (llama.cpp) as an automatic fallback.
+OpenAI-compatible LLM router that bridges **multiple cloud providers** (HuggingFace, NVIDIA NIM, Cerebras, Groq, Google AI, OpenRouter) with **local self-hosted models** (llama.cpp) as an automatic fallback.
 
 The default configuration now supports **zero-cost-first routing**: a packaged 52-entry provider/program matrix assigns each free route a reproducible score, filters finite trials and eligibility-gated offers by policy, blends the static score with live quota/health telemetry, and moves to the next renewable route when a provider is rate-limited or exhausted.
 
@@ -50,6 +50,11 @@ With the current matrix, configured recurring providers such as Groq and Hugging
 | `GET /v1/provider-matrix` | Configured provider metadata, eligibility reasons, static score and live dynamic score |
 | `GET /v1/metrics` | Router metrics for all providers |
 | `GET /v1/metrics/{provider}` | Metrics for one provider |
+| `GET /dashboard` | Single-page web dashboard (no auth; localhost friendly) |
+| `GET /logs` | Event log + message log dashboard |
+| `GET /dashboard/api?days=7&events=50` | Aggregated JSON backing the dashboard |
+| `GET /logs/api` | Filtered event + message log JSON |
+| `GET /analytics/api` | Reliability, failover, token, and cost analytics |
 | `POST /v1/chat/completions` | OpenAI-compatible chat completion (streaming + non-streaming) |
 
 ## Setup

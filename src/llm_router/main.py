@@ -4,12 +4,16 @@ from __future__ import annotations
 import hmac
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from .config import ConfigError, load_settings
+from .dashboard import router as dashboard_router
+from .log_events import configure_logging
 from .providers.base import (
     ProviderRequestError,
     ProviderUnavailable,
@@ -36,32 +40,53 @@ async def lifespan(app: FastAPI):
     global _settings, _router
     import logging
 
-    logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
     try:
         _settings = load_settings()
     except ConfigError as exc:
         raise RuntimeError(f"configuration error: {exc}") from exc
 
+    config_dir = Path(__file__).resolve().parent.parent.parent
+    configure_logging(_settings.logs, log_file_dir=config_dir)
+
     limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
     async with httpx.AsyncClient(timeout=_settings.timeout_seconds, limits=limits) as http:
         router_cls = ZeroCostModelRouter if _settings.strategy == "zero-cost" else ModelRouter
         _router = router_cls(_settings, http)
         await _router.start_background_tasks()
-        logger.info("llm-router started with strategy=%s", _settings.strategy)
+        await _router._log_event(
+            level="info",
+            source="app",
+            message=f"llm-router started with strategy={_settings.strategy}",
+            details={"strategy": _settings.strategy, "providers": list(_router.providers)},
+        )
         try:
             yield
         finally:
+            try:
+                await _router._log_event(
+                    level="info", source="app", message="llm-router stopping"
+                )
+            except Exception:
+                pass
             await _router.stop_background_tasks()
             logger.info("llm-router stopped")
 
 
 app = FastAPI(title="llm-router", version="0.1.0", lifespan=lifespan)
 
+app.include_router(dashboard_router)
+app.mount(
+    "/static",
+    StaticFiles(directory=Path(__file__).resolve().parent / "static"),
+    name="static",
+)
+
 
 @app.middleware("http")
 async def optional_router_auth(request: Request, call_next):
-    if _settings is not None and _settings.router_api_key and request.url.path.startswith("/v1/"):
+    protected = request.url.path.startswith(("/v1/", "/dashboard", "/logs", "/analytics"))
+    if _settings is not None and _settings.router_api_key and protected:
         bearer = request.headers.get("authorization", "")
         supplied = bearer.removeprefix("Bearer ").strip() or request.headers.get("x-api-key", "")
         if not supplied or not hmac.compare_digest(supplied, _settings.router_api_key):
@@ -74,17 +99,23 @@ async def optional_router_auth(request: Request, call_next):
 
 @app.exception_handler(ProviderRequestError)
 async def on_request_error(_: Request, exc: ProviderRequestError):
+    import logging
+    logging.getLogger(__name__).warning("provider request error: %s", exc)
     status = exc.status_code if exc.status_code and 400 <= exc.status_code < 500 else 400
     return JSONResponse(status_code=status, content={"error": {"message": str(exc), "type": "invalid_request_error"}})
 
 
 @app.exception_handler(ProviderUnavailable)
 async def on_unavailable(_: Request, exc: ProviderUnavailable):
+    import logging
+    logging.getLogger(__name__).error("provider unavailable: %s", exc)
     return JSONResponse(status_code=503, content={"error": {"message": str(exc), "type": "unavailable"}})
 
 
 @app.exception_handler(QuotaExceededError)
 async def on_quota_exceeded(_: Request, exc: QuotaExceededError):
+    import logging
+    logging.getLogger(__name__).warning("quota exceeded for %s: %s", exc.provider, exc)
     return JSONResponse(
         status_code=429,
         content={"error": {"message": str(exc), "type": "quota_exceeded", "provider": exc.provider}},
@@ -194,10 +225,10 @@ async def prometheus_metrics():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
-    token = set_forwarded_request_headers(dict(request.headers))
     router = get_router()
     if req.stream:
         async def event_source():
+            token = set_forwarded_request_headers(dict(request.headers))
             try:
                 async for line in router.stream(req):
                     yield line + "\n"
@@ -213,6 +244,7 @@ async def chat_completions(req: ChatRequest, request: Request):
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+    token = set_forwarded_request_headers(dict(request.headers))
     try:
         response = await router.complete(req)
         return JSONResponse(content=response.model_dump(exclude_none=True))

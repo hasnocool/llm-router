@@ -7,6 +7,7 @@ from ..async_metrics import AsyncMetricsStore
 from ..config import ProviderConfig
 from .base import Provider
 from .google_ai import GoogleAIProvider
+from .openrouter import OpenRouterProvider
 
 PROVIDER_CLASSES: dict[str, type[Provider]] = {
     "huggingface": Provider,
@@ -15,6 +16,7 @@ PROVIDER_CLASSES: dict[str, type[Provider]] = {
     "nvidia": Provider,
     "groq": Provider,
     "google_ai": GoogleAIProvider,
+    "openrouter": OpenRouterProvider,
 }
 
 _metrics_store: AsyncMetricsStore | None = None

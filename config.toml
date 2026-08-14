@@ -7,11 +7,11 @@
 #   "local-first" -> prefer the local llama.cpp provider before cloud routes.
 strategy = "zero-cost"
 
-# Only these providers participate in automatic/fallback routing and in the
-# /v1/models list (so OpenClaude only offers these). Explicit "provider:model"
-# requests still work for any configured provider.
+# Providers eligible for automatic/fallback routing and the /v1/models list.
+# Under strategy="zero-cost", "auto" picks the best-ranked healthy provider and
+# fails over through the rest. Explicit "provider:model" requests always work.
 [routing]
-providers = ["huggingface"]
+providers = ["groq", "huggingface", "google_ai", "cerebras", "nvidia", "openrouter", "local"]
 
 # Seconds to wait before treating a non-streaming call as failed (per provider).
 timeout_seconds = 60.0
@@ -32,7 +32,7 @@ default_model = "granite-3.3-2b-instruct"
 [providers.cerebras]
 name = "Cerebras Inference"
 base_url = "https://api.cerebras.ai/v1"
-default_model = "llama-3.3-70b"
+default_model = "gpt-oss-120b"
 api_key_env = "CEREBRAS_API_KEY"
 timeout_seconds = 120.0
 stream_timeout_seconds = 240.0
@@ -50,6 +50,14 @@ name = "NVIDIA NIM"
 base_url = "https://integrate.api.nvidia.com/v1"
 default_model = "meta/llama-3.3-70b-instruct"
 api_key_env = "NVIDIA_API_KEY"
+timeout_seconds = 120.0
+stream_timeout_seconds = 240.0
+
+[providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+default_model = "openrouter/free"
+api_key_env = "OPENROUTER_API_KEY"
 timeout_seconds = 120.0
 stream_timeout_seconds = 240.0
 
@@ -84,10 +92,61 @@ stream_timeout_seconds = 240.0
 flush_interval_seconds = 30
 retention_days = 30
 report_interval_seconds = 300
-# /models is never used as a background heartbeat. Explicit discovery is cached.
 model_cache_ttl_seconds = 21600
 model_failure_backoff_seconds = 300
 model_failure_backoff_max_seconds = 3600
+# /models is never used as a background heartbeat. Explicit discovery is cached.
+
+[logs]
+# Root logger level: DEBUG, INFO, WARNING, ERROR
+level = "INFO"
+# Optional rotating file log (relative to config.toml or absolute).
+# Omit or set to "" to disable file logging (console + dashboard event log remain).
+file_path = "logs/router.log"
+max_bytes = 10485760
+backup_count = 5
+# Persist full request/response bodies only when explicitly enabled for local debugging.
+# Bodies may contain private or personal data.
+log_message_bodies = false
+max_body_chars = 120000
+
+[analytics]
+# Estimated USD per 1M tokens. Tune these to your actual provider plans.
+currency = "USD"
+default_input_cost_per_1m_tokens = 0.25
+default_output_cost_per_1m_tokens = 0.25
+error_rate_warning_threshold = 0.05
+error_rate_critical_threshold = 0.10
+failover_rate_warning_threshold = 0.15
+
+[analytics.pricing.groq]
+input_cost_per_1m_tokens = 0.59
+output_cost_per_1m_tokens = 0.79
+
+[analytics.pricing.huggingface]
+input_cost_per_1m_tokens = 0.25
+output_cost_per_1m_tokens = 0.25
+
+[analytics.pricing.google_ai]
+input_cost_per_1m_tokens = 0.35
+output_cost_per_1m_tokens = 1.05
+
+[analytics.pricing.cerebras]
+input_cost_per_1m_tokens = 0.25
+output_cost_per_1m_tokens = 0.75
+
+[analytics.pricing.nvidia]
+input_cost_per_1m_tokens = 0.10
+output_cost_per_1m_tokens = 0.10
+
+[analytics.pricing.openrouter]
+# OpenRouter is configured for a free model right now.
+input_cost_per_1m_tokens = 0.0
+output_cost_per_1m_tokens = 0.0
+
+[analytics.pricing.local]
+input_cost_per_1m_tokens = 0.0
+output_cost_per_1m_tokens = 0.0
 
 # Provider quotas are frequently model/tier/account-specific and change over time.
 # The router learns provider-side request/token windows from response headers.

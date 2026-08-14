@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from llm_router.config import ModelRoute, ProviderConfig, Settings
-from llm_router.providers.base import QuotaExceededError
+from llm_router.providers.base import ProviderRequestError, QuotaExceededError
 from llm_router.schemas import ChatRequest, Message
 from llm_router.zero_cost_router import ZeroCostModelRouter
 
@@ -106,3 +107,75 @@ async def test_zero_cost_auto_respects_routing_pool() -> None:
         router = ZeroCostModelRouter(settings, client)
         order = router._order(ChatRequest(model="auto", messages=[Message(role="user", content="hi")]))
         assert order == [("huggingface", "hf-default")]
+
+
+async def test_streaming_413_fails_over_instead_of_crashing() -> None:
+    async def handler(request):
+        if request.url.host == "groq.example":
+            return httpx.Response(
+                413,
+                content=b'{"error": {"message": "payload too large"}}',
+                request=request,
+                headers={"content-type": "application/json"},
+            )
+        sse = (
+            'data: {"id":"s","choices":[{"index":0,"delta":{"content":"ok from hf"}}]}'
+            "\n\n"
+            "data: [DONE]"
+            "\n\n"
+        )
+        return httpx.Response(
+            200, content=sse, request=request, headers={"content-type": "text/event-stream"}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        router = ZeroCostModelRouter(make_settings(), client)
+        lines = [ln async for ln in router.stream(request())]
+        assert any('"provider": "huggingface"' in ln for ln in lines)
+
+
+async def test_streaming_client_error_fails_over_on_auto_routing() -> None:
+    async def handler(request):
+        if request.url.host == "groq.example":
+            return httpx.Response(
+                404,
+                content=b'{"error": {"message": "model not found"}}',
+                request=request,
+                headers={"content-type": "application/json"},
+            )
+        sse = (
+            'data: {"id":"s","choices":[{"index":0,"delta":{"content":"ok from hf"}}]}'
+            "\n\n"
+            "data: [DONE]"
+            "\n\n"
+        )
+        return httpx.Response(
+            200, content=sse, request=request, headers={"content-type": "text/event-stream"}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        router = ZeroCostModelRouter(make_settings(), client)
+        lines = [ln async for ln in router.stream(request())]
+        assert any('"provider": "huggingface"' in ln for ln in lines)
+
+
+async def test_complete_client_error_propagates_for_explicit_request() -> None:
+    async def handler(request):
+        return httpx.Response(
+            404,
+            content=b'{"error": {"message": "model not found"}}',
+            request=request,
+            headers={"content-type": "application/json"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        router = ZeroCostModelRouter(make_settings(), client)
+        req = ChatRequest(model="groq:groq-default", messages=[Message(role="user", content="hi")])
+        with pytest.raises(ProviderRequestError):
+            await router.complete(req)

@@ -15,9 +15,11 @@ from ..rate_limits import RateLimitParser, extract_usage_from_response, retry_af
 
 # HTTP statuses that indicate the provider is unavailable (retryable/failover).
 # 402 (payment required) is included so auto/fallback routing skips providers
-# whose billing/quota prevents them from serving. Anything else (400/401/403/
-# 404/422) is a client error and never triggers failover.
-RETRYABLE_STATUSES = {402, 429, 500, 502, 503, 504}
+# whose billing/quota prevents them from serving. 413 (payload too large) is
+# also retryable because context/payload limits are provider-specific: a prompt
+# rejected by one provider may fit another, so zero-cost routing fails over.
+# Anything else (400/401/403/404/422) is a client error and never triggers failover.
+RETRYABLE_STATUSES = {402, 413, 429, 500, 502, 503, 504}
 
 FORWARDED_REQUEST_HEADERS: ContextVar[dict[str, str]] = ContextVar(
     "forwarded_request_headers", default={}
@@ -91,6 +93,26 @@ def estimate_request_tokens(payload: dict[str, Any]) -> int:
     return input_estimate + max(0, output_estimate)
 
 
+def classify_request_kind(payload: dict[str, Any]) -> str:
+    tool_choice = payload.get("tool_choice")
+    if tool_choice == "none":
+        return "chat"
+    if payload.get("tools") or tool_choice:
+        return "tool_call"
+    return "chat"
+
+
+def classify_response_kind(data: dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    choice = choices[0] if choices else {}
+    message = choice.get("message") or {}
+    if message.get("tool_calls"):
+        return "tool_call"
+    if choice.get("finish_reason") == "tool_calls":
+        return "tool_call"
+    return "chat"
+
+
 class Provider:
     def __init__(
         self,
@@ -115,7 +137,7 @@ class Provider:
     def _url(self, path: str) -> str:
         return f"{self.config.base_url}/{path.lstrip('/')}"
 
-    def _check_status(self, resp: httpx.Response) -> None:
+    async def _check_status(self, resp: httpx.Response) -> None:
         if resp.status_code in RETRYABLE_STATUSES:
             raise ProviderUnavailable(
                 f"{self.name} returned HTTP {resp.status_code}",
@@ -123,10 +145,15 @@ class Provider:
                 retry_after_until=retry_after_timestamp(resp.headers),
             )
         if resp.status_code >= 400:
+            try:
+                await resp.aread()
+                body = resp.text[:2000]
+            except (httpx.HTTPError, httpx.StreamError, UnicodeError):
+                body = ""
             raise ProviderRequestError(
                 f"{self.name} returned HTTP {resp.status_code}",
                 status_code=resp.status_code,
-                body=resp.text[:2000],
+                body=body,
             )
 
     async def _reserve_quota(self, payload: dict[str, Any]) -> str | None:
@@ -155,7 +182,8 @@ class Provider:
         completion_tokens: int = 0,
         latency_ms: float = 0.0,
         status_code: int | None = None,
-        request_kind: str = "inference",
+        request_kind: str = "chat",
+        response_kind: str = "",
     ) -> None:
         if self._metrics_store is None:
             return
@@ -168,6 +196,7 @@ class Provider:
             latency_ms,
             status_code,
             request_kind,
+            response_kind,
         )
 
     async def models(self) -> list[dict[str, Any]]:
@@ -179,7 +208,7 @@ class Provider:
             )
             status_code = resp.status_code
             await self._record_rate_limits(dict(resp.headers))
-            self._check_status(resp)
+            await self._check_status(resp)
             data = resp.json()
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
             await self._record_attempt(
@@ -211,6 +240,7 @@ class Provider:
 
     async def complete(self, payload: dict[str, Any]) -> dict[str, Any]:
         reservation_id = await self._reserve_quota(payload)
+        request_kind = classify_request_kind(payload)
         t0 = time.perf_counter()
         status_code: int | None = None
         try:
@@ -222,7 +252,7 @@ class Provider:
             )
             status_code = resp.status_code
             await self._record_rate_limits(dict(resp.headers))
-            self._check_status(resp)
+            await self._check_status(resp)
             data = resp.json()
             prompt_tokens, completion_tokens = extract_usage_from_response(data)
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
@@ -231,6 +261,7 @@ class Provider:
                 success=False,
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 status_code=status_code,
+                request_kind=request_kind,
             )
             raise ProviderUnavailable(f"{self.name} unreachable: {exc}") from exc
         except (ProviderUnavailable, ProviderRequestError):
@@ -239,6 +270,7 @@ class Provider:
                 success=False,
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 status_code=status_code,
+                request_kind=request_kind,
             )
             raise
 
@@ -249,17 +281,21 @@ class Provider:
             completion_tokens=completion_tokens,
             latency_ms=(time.perf_counter() - t0) * 1000,
             status_code=status_code,
+            request_kind=request_kind,
+            response_kind=classify_response_kind(data),
         )
         return data
 
     async def stream(self, payload: dict[str, Any]) -> AsyncIterator[str]:
         reservation_id = await self._reserve_quota(payload)
+        request_kind = classify_request_kind(payload)
         t0 = time.perf_counter()
         emitted = False
         prompt_tokens = 0
         completion_tokens = 0
         status_code: int | None = None
         recorded = False
+        tool_response = False
         try:
             async with self._http.stream(
                 "POST",
@@ -270,7 +306,7 @@ class Provider:
             ) as resp:
                 status_code = resp.status_code
                 await self._record_rate_limits(dict(resp.headers))
-                self._check_status(resp)
+                await self._check_status(resp)
                 async for line in resp.aiter_lines():
                     if line:
                         emitted = True
@@ -278,6 +314,8 @@ class Provider:
                     if usage:
                         prompt_tokens = max(prompt_tokens, usage[0])
                         completion_tokens = max(completion_tokens, usage[1])
+                    if self._stream_chunk_has_tool_calls(line):
+                        tool_response = True
                     yield line
             await self._record_attempt(
                 reservation_id=reservation_id,
@@ -286,6 +324,8 @@ class Provider:
                 completion_tokens=completion_tokens,
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 status_code=status_code,
+                request_kind=request_kind,
+                response_kind="tool_call" if tool_response else "chat",
             )
             recorded = True
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
@@ -296,6 +336,7 @@ class Provider:
                 completion_tokens=completion_tokens,
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 status_code=status_code,
+                request_kind=request_kind,
             )
             recorded = True
             if emitted:
@@ -309,12 +350,30 @@ class Provider:
                 completion_tokens=completion_tokens,
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 status_code=status_code,
+                request_kind=request_kind,
             )
             recorded = True
             raise
         finally:
             if not recorded and self._metrics_store is not None:
                 await self._metrics_store.cancel_reservation(reservation_id)
+
+    @staticmethod
+    def _stream_chunk_has_tool_calls(line: str) -> bool:
+        if not line.startswith("data:"):
+            return False
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            return False
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            return False
+        for choice in obj.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if delta.get("tool_calls"):
+                return True
+        return False
 
     @staticmethod
     def _extract_streaming_usage(line: str) -> tuple[int, int] | None:

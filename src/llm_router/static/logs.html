@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-router logs</title>
+<link rel="stylesheet" href="/static/dashboard.css">
+<link rel="stylesheet" href="/static/logs.css">
+</head>
+<body>
+<header>
+  <h1>llm-router <span class="badge">logs</span></h1>
+  <div class="controls">
+    <a class="navlink" href="/dashboard">Dashboard</a>
+    <label class="toggle">
+      <input type="checkbox" id="autorefresh" checked>
+      Auto-refresh (5s)
+    </label>
+    <span id="status" class="status"></span>
+    <span id="updated" class="updated"></span>
+  </div>
+</header>
+
+<section class="panel filters">
+  <div class="filter-row">
+    <label>View:
+      <select id="view">
+        <option value="both">Events + messages</option>
+        <option value="events">Events only</option>
+        <option value="messages">Messages only</option>
+      </select>
+    </label>
+    <label>Level:
+      <select id="level">
+        <option value="all">All levels</option>
+        <option value="error">Errors</option>
+        <option value="warning">Warnings</option>
+        <option value="info">Info</option>
+        <option value="debug">Debug</option>
+      </select>
+    </label>
+    <label>Provider:
+      <select id="provider"><option value="">All providers</option></select>
+    </label>
+    <label>Days:
+      <select id="days">
+        <option value="1">1</option>
+        <option value="7">7</option>
+        <option value="30">30</option>
+      </select>
+    </label>
+    <label>Rows:
+      <select id="limit">
+        <option value="100">100</option>
+        <option value="200" selected>200</option>
+        <option value="500">500</option>
+        <option value="1000">1000</option>
+      </select>
+    </label>
+    <label>Request ID:
+      <input type="text" id="request_id" placeholder="filter by request id">
+    </label>
+    <button id="apply" class="btn">Apply</button>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Event log</h2>
+  <div id="event-count" class="log-count"></div>
+  <div id="events-wrap" class="log-scroll">
+    <table id="events">
+      <thead>
+        <tr>
+          <th>Time</th><th>Level</th><th>Source</th><th>Provider</th><th>Model</th>
+          <th>Message</th><th>Request ID</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Message log</h2>
+  <div id="message-count" class="log-count"></div>
+  <div id="messages-wrap" class="log-scroll">
+    <table id="messages">
+      <thead>
+        <tr>
+          <th>Time</th><th>Provider</th><th>Model</th><th>Kind</th><th>Result</th>
+          <th>Tokens</th><th>Latency</th><th>Request ID</th><th></th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<script src="/static/logs.js"></script>
+</body>
+</html>

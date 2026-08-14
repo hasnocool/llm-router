@@ -12,6 +12,12 @@ from pathlib import Path
 from typing import Iterable
 
 
+def _json_dumps(value: object) -> str:
+    import json
+
+    return json.dumps(value, default=str, ensure_ascii=False)
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS provider_daily_metrics (
     provider_name TEXT NOT NULL,
@@ -56,7 +62,9 @@ CREATE TABLE IF NOT EXISTS provider_request_events (
     total_tokens INTEGER DEFAULT 0,
     latency_ms REAL DEFAULT 0,
     status_code INTEGER,
-    request_kind TEXT NOT NULL DEFAULT 'inference'
+    request_kind TEXT NOT NULL DEFAULT 'chat',
+    response_kind TEXT NOT NULL DEFAULT '',
+    task_kind TEXT NOT NULL DEFAULT 'general'
 );
 
 CREATE TABLE IF NOT EXISTS provider_quota_reservations (
@@ -68,6 +76,26 @@ CREATE TABLE IF NOT EXISTS provider_quota_reservations (
     reserved_tokens INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS router_request_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL DEFAULT '',
+    occurred_at REAL NOT NULL,
+    provider_name TEXT,
+    model TEXT NOT NULL DEFAULT '',
+    task_kind TEXT NOT NULL DEFAULT 'general',
+    stream INTEGER NOT NULL DEFAULT 0,
+    explicit INTEGER NOT NULL DEFAULT 0,
+    failover_index INTEGER NOT NULL DEFAULT 0,
+    request_kind TEXT NOT NULL DEFAULT 'chat',
+    response_kind TEXT NOT NULL DEFAULT '',
+    success INTEGER NOT NULL,
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    latency_ms REAL DEFAULT 0,
+    status_code INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_daily_metrics_date
     ON provider_daily_metrics(metric_date);
 CREATE INDEX IF NOT EXISTS idx_daily_metrics_provider
@@ -76,6 +104,121 @@ CREATE INDEX IF NOT EXISTS idx_request_events_provider_time
     ON provider_request_events(provider_name, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_quota_reservations_provider
     ON provider_quota_reservations(provider_name, expires_at);
+CREATE INDEX IF NOT EXISTS idx_router_events_occurred
+    ON router_request_events(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_router_events_provider
+    ON router_request_events(provider_name);
+
+CREATE TABLE IF NOT EXISTS routing_decisions (
+    request_id TEXT PRIMARY KEY,
+    occurred_at REAL NOT NULL,
+    task_kind TEXT NOT NULL DEFAULT 'general',
+    request_kind TEXT NOT NULL DEFAULT 'chat',
+    explicit INTEGER NOT NULL DEFAULT 0,
+    selected_provider TEXT,
+    selected_model TEXT NOT NULL DEFAULT '',
+    selected_rank INTEGER NOT NULL DEFAULT 0,
+    selected_score REAL NOT NULL DEFAULT 0,
+    learned_bonus REAL NOT NULL DEFAULT 0,
+    exploration_bonus REAL NOT NULL DEFAULT 0,
+    candidate_json TEXT NOT NULL DEFAULT '[]',
+    epsilon REAL NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_routing_decisions_time
+    ON routing_decisions(occurred_at);
+
+CREATE TABLE IF NOT EXISTS routing_adaptation_stats (
+    provider_name TEXT NOT NULL,
+    task_kind TEXT NOT NULL DEFAULT 'general',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    successes INTEGER NOT NULL DEFAULT 0,
+    failures INTEGER NOT NULL DEFAULT 0,
+    total_reward REAL NOT NULL DEFAULT 0,
+    total_latency_ms REAL NOT NULL DEFAULT 0,
+    latency_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at REAL NOT NULL DEFAULT 0,
+    last_success_at REAL NOT NULL DEFAULT 0,
+    last_failure_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY(provider_name, task_kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_routing_adapt_task
+    ON routing_adaptation_stats(task_kind, provider_name);
+
+CREATE TABLE IF NOT EXISTS app_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at REAL NOT NULL,
+    level TEXT NOT NULL DEFAULT 'info',
+    source TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL,
+    provider TEXT,
+    model TEXT,
+    request_id TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_app_events_time
+    ON app_events(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_app_events_provider
+    ON app_events(provider);
+
+CREATE TABLE IF NOT EXISTS router_message_logs (
+    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL DEFAULT '',
+    occurred_at REAL NOT NULL,
+    provider_name TEXT,
+    model TEXT NOT NULL DEFAULT '',
+    stream INTEGER NOT NULL DEFAULT 0,
+    explicit INTEGER NOT NULL DEFAULT 0,
+    success INTEGER NOT NULL,
+    request_kind TEXT NOT NULL DEFAULT 'chat',
+    response_kind TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    latency_ms REAL DEFAULT 0,
+    status_code INTEGER,
+    request_json TEXT NOT NULL DEFAULT '',
+    response_json TEXT NOT NULL DEFAULT '',
+    error_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_logs_time
+    ON router_message_logs(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_message_logs_request
+    ON router_message_logs(request_id);
+
+CREATE TABLE IF NOT EXISTS provider_models (
+    provider_name TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    discovered_at REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    source TEXT NOT NULL DEFAULT 'discovery',
+    -- Fetched per-model pricing (USD per 1M tokens) and specs, refreshed on
+    -- every discovery poll. NULL means "unknown / use config pricing".
+    input_cost_per_1m REAL,
+    output_cost_per_1m REAL,
+    request_cost REAL,
+    max_output_tokens INTEGER,
+    -- Rate limits (per minute / per day / per second). Sources: live headers,
+    -- curated docs catalog, or config overrides.
+    rpm INTEGER,
+    rpd INTEGER,
+    tpm INTEGER,
+    tpd INTEGER,
+    rps INTEGER,
+    rate_limit_source TEXT NOT NULL DEFAULT '',
+    meta_updated_at REAL,
+    PRIMARY KEY (provider_name, model_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_models_provider
+    ON provider_models(provider_name, last_seen);
+CREATE INDEX IF NOT EXISTS idx_router_events_model
+    ON router_request_events(provider_name, model, occurred_at);
 """
 
 
@@ -163,7 +306,59 @@ class MetricsDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._get_conn()
         conn.executescript(SCHEMA)
+        conn.execute("PRAGMA user_version")
+        self._migrate(conn)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_request_events_task ON provider_request_events(task_kind, occurred_at)"
+        )
         conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add columns introduced after the original schema to existing databases."""
+        events_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(provider_request_events)")
+        }
+        if "response_kind" not in events_cols:
+            conn.execute(
+                "ALTER TABLE provider_request_events "
+                "ADD COLUMN response_kind TEXT NOT NULL DEFAULT ''"
+            )
+        if "task_kind" not in events_cols:
+            conn.execute(
+                "ALTER TABLE provider_request_events "
+                "ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'general'"
+            )
+        router_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(router_request_events)")
+        }
+        if "request_id" not in router_cols:
+            conn.execute(
+                "ALTER TABLE router_request_events "
+                "ADD COLUMN request_id TEXT NOT NULL DEFAULT ''"
+            )
+        # Provider model metadata columns added after the original schema.
+        model_cols = {row["name"] for row in conn.execute("PRAGMA table_info(provider_models)")}
+        model_columns = {
+            "input_cost_per_1m": "REAL",
+            "output_cost_per_1m": "REAL",
+            "request_cost": "REAL",
+            "max_output_tokens": "INTEGER",
+            "rpm": "INTEGER",
+            "rpd": "INTEGER",
+            "tpm": "INTEGER",
+            "tpd": "INTEGER",
+            "rps": "INTEGER",
+            "rate_limit_source": "TEXT NOT NULL DEFAULT ''",
+            "meta_updated_at": "REAL",
+        }
+        for column, decl in model_columns.items():
+            if column not in model_cols:
+                conn.execute(f"ALTER TABLE provider_models ADD COLUMN {column} {decl}")
+        if "task_kind" not in router_cols:
+            conn.execute(
+                "ALTER TABLE router_request_events "
+                "ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'general'"
+            )
 
     @contextmanager
     def transaction(self, *, immediate: bool = False):
@@ -211,6 +406,8 @@ class MetricsDB:
         status_code: int | None,
         request_kind: str,
         occurred_at: float,
+        response_kind: str = "",
+        task_kind: str = "general",
     ) -> None:
         metric_date = datetime.fromtimestamp(occurred_at, tz=timezone.utc).date().isoformat()
         total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
@@ -218,8 +415,8 @@ class MetricsDB:
             """
             INSERT INTO provider_request_events
             (provider_name, occurred_at, success, prompt_tokens, completion_tokens,
-             total_tokens, latency_ms, status_code, request_kind)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             total_tokens, latency_ms, status_code, request_kind, response_kind, task_kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 provider,
@@ -231,6 +428,8 @@ class MetricsDB:
                 max(0.0, latency_ms),
                 status_code,
                 request_kind,
+                response_kind,
+                task_kind or "general",
             ),
         )
         conn.execute(
@@ -268,7 +467,9 @@ class MetricsDB:
         completion_tokens: int = 0,
         latency_ms: float = 0.0,
         status_code: int | None = None,
-        request_kind: str = "inference",
+        request_kind: str = "chat",
+        response_kind: str = "",
+        task_kind: str = "general",
     ) -> None:
         with self.transaction() as conn:
             self._record_request_conn(
@@ -281,6 +482,8 @@ class MetricsDB:
                 status_code,
                 request_kind,
                 time.time(),
+                response_kind=response_kind,
+                task_kind=task_kind,
             )
 
     def upsert_rate_limits(self, provider: str, limits: Iterable[object]) -> None:
@@ -479,7 +682,9 @@ class MetricsDB:
         completion_tokens: int = 0,
         latency_ms: float = 0.0,
         status_code: int | None = None,
-        request_kind: str = "inference",
+        request_kind: str = "chat",
+        response_kind: str = "",
+        task_kind: str = "general",
     ) -> None:
         with self.transaction(immediate=True) as conn:
             if reservation_id:
@@ -497,7 +702,728 @@ class MetricsDB:
                 status_code,
                 request_kind,
                 time.time(),
+                response_kind=response_kind,
+                task_kind=task_kind,
             )
+
+    def record_router_event(
+        self,
+        provider: str | None,
+        model: str,
+        stream: bool,
+        explicit: bool,
+        failover_index: int,
+        success: bool,
+        task_kind: str = "general",
+        request_kind: str = "chat",
+        response_kind: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: float = 0.0,
+        status_code: int | None = None,
+        occurred_at: float | None = None,
+        request_id: str = "",
+    ) -> None:
+        with self.transaction() as conn:
+            total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
+            conn.execute(
+                """
+                INSERT INTO router_request_events
+                (occurred_at, provider_name, model, task_kind, stream, explicit, failover_index,
+                 request_kind, response_kind, success, prompt_tokens, completion_tokens,
+                 total_tokens, latency_ms, status_code, request_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    time.time() if occurred_at is None else occurred_at,
+                    provider,
+                    model,
+                    task_kind,
+                    1 if stream else 0,
+                    1 if explicit else 0,
+                    failover_index,
+                    request_kind,
+                    response_kind,
+                    1 if success else 0,
+                    max(0, prompt_tokens),
+                    max(0, completion_tokens),
+                    total_tokens,
+                    max(0.0, latency_ms),
+                    status_code,
+                    request_id,
+                ),
+            )
+
+    def record_routing_decision(
+        self,
+        *,
+        request_id: str,
+        occurred_at: float,
+        task_kind: str,
+        request_kind: str,
+        explicit: bool,
+        selected_provider: str | None,
+        selected_model: str,
+        selected_rank: int,
+        selected_score: float,
+        learned_bonus: float,
+        exploration_bonus: float,
+        candidate_json: str,
+        epsilon: float,
+        notes: str = "",
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO routing_decisions
+                (request_id, occurred_at, task_kind, request_kind, explicit, selected_provider,
+                 selected_model, selected_rank, selected_score, learned_bonus, exploration_bonus,
+                 candidate_json, epsilon, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(request_id) DO UPDATE SET
+                    occurred_at = excluded.occurred_at,
+                    task_kind = excluded.task_kind,
+                    request_kind = excluded.request_kind,
+                    explicit = excluded.explicit,
+                    selected_provider = excluded.selected_provider,
+                    selected_model = excluded.selected_model,
+                    selected_rank = excluded.selected_rank,
+                    selected_score = excluded.selected_score,
+                    learned_bonus = excluded.learned_bonus,
+                    exploration_bonus = excluded.exploration_bonus,
+                    candidate_json = excluded.candidate_json,
+                    epsilon = excluded.epsilon,
+                    notes = excluded.notes,
+                    created_at = excluded.created_at
+                """,
+                (
+                    request_id,
+                    occurred_at,
+                    task_kind,
+                    request_kind,
+                    1 if explicit else 0,
+                    selected_provider,
+                    selected_model,
+                    selected_rank,
+                    selected_score,
+                    learned_bonus,
+                    exploration_bonus,
+                    candidate_json,
+                    epsilon,
+                    notes,
+                    occurred_at,
+                ),
+            )
+
+    def upsert_routing_adaptation_stats(
+        self,
+        provider_name: str,
+        task_kind: str,
+        *,
+        attempts: int,
+        successes: int,
+        failures: int,
+        total_reward: float,
+        total_latency_ms: float,
+        latency_count: int,
+        last_attempt_at: float,
+        last_success_at: float,
+        last_failure_at: float,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO routing_adaptation_stats
+                (provider_name, task_kind, attempts, successes, failures, total_reward,
+                 total_latency_ms, latency_count, last_attempt_at, last_success_at, last_failure_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider_name, task_kind) DO UPDATE SET
+                    attempts = excluded.attempts,
+                    successes = excluded.successes,
+                    failures = excluded.failures,
+                    total_reward = excluded.total_reward,
+                    total_latency_ms = excluded.total_latency_ms,
+                    latency_count = excluded.latency_count,
+                    last_attempt_at = excluded.last_attempt_at,
+                    last_success_at = excluded.last_success_at,
+                    last_failure_at = excluded.last_failure_at
+                """,
+                (
+                    provider_name,
+                    task_kind,
+                    attempts,
+                    successes,
+                    failures,
+                    total_reward,
+                    total_latency_ms,
+                    latency_count,
+                    last_attempt_at,
+                    last_success_at,
+                    last_failure_at,
+                ),
+            )
+
+    def get_recent_router_events(self, limit: int = 100) -> list[dict[str, object]]:
+        rows = self._get_conn().execute(
+            """
+            SELECT * FROM router_request_events
+            ORDER BY occurred_at DESC
+            LIMIT ?
+            """,
+            (max(1, limit),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_provider_attempt_metrics(self, days: int = 7) -> list[dict[str, object]]:
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT
+                provider_name,
+                COUNT(*) AS attempts,
+                SUM(success) AS successes,
+                SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures,
+                SUM(prompt_tokens) AS prompt_tokens,
+                SUM(completion_tokens) AS completion_tokens,
+                SUM(total_tokens) AS total_tokens,
+                AVG(latency_ms) AS avg_latency_ms,
+                MIN(latency_ms) AS min_latency_ms,
+                MAX(latency_ms) AS max_latency_ms
+            FROM provider_request_events
+            WHERE occurred_at >= ? AND request_kind != 'model_discovery'
+            GROUP BY provider_name
+            ORDER BY attempts DESC, provider_name
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_provider_task_metrics(self, days: int = 30) -> list[dict[str, object]]:
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT
+                provider_name,
+                task_kind,
+                COUNT(*) AS attempts,
+                SUM(success) AS successes,
+                SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures,
+                AVG(latency_ms) AS avg_latency_ms,
+                MAX(occurred_at) AS last_attempt_at,
+                MAX(CASE WHEN success = 1 THEN occurred_at END) AS last_success_at,
+                MAX(CASE WHEN success = 0 THEN occurred_at END) AS last_failure_at
+            FROM provider_request_events
+            WHERE occurred_at >= ? AND request_kind != 'model_discovery' AND task_kind NOT LIKE 'explicit:%'
+            GROUP BY provider_name, task_kind
+            ORDER BY provider_name, task_kind
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_routing_decisions(self, days: int = 30) -> list[dict[str, object]]:
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT * FROM routing_decisions
+            WHERE occurred_at >= ?
+            ORDER BY occurred_at DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_task_breakdown(self, days: int = 30) -> dict[str, int]:
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT task_kind, COUNT(*) AS count
+            FROM router_request_events
+            WHERE occurred_at >= ?
+            GROUP BY task_kind
+            """,
+            (cutoff,),
+        ).fetchall()
+        return {row["task_kind"]: int(row["count"]) for row in rows}
+
+    def get_router_attempt_metrics(self, days: int = 7) -> list[dict[str, object]]:
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT
+                provider_name,
+                COUNT(*) AS requests,
+                SUM(success) AS successes,
+                SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures,
+                SUM(CASE WHEN failover_index > 0 THEN 1 ELSE 0 END) AS failovers,
+                SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END) AS streams,
+                SUM(CASE WHEN explicit = 1 THEN 1 ELSE 0 END) AS explicit_requests,
+                SUM(prompt_tokens) AS prompt_tokens,
+                SUM(completion_tokens) AS completion_tokens,
+                SUM(total_tokens) AS total_tokens,
+                AVG(latency_ms) AS avg_latency_ms
+            FROM router_request_events
+            WHERE occurred_at >= ? AND provider_name IS NOT NULL
+            GROUP BY provider_name
+            ORDER BY requests DESC, provider_name
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_request_timeline(self, days: int = 30) -> list[dict[str, object]]:
+        cutoff = time.time() - days * 86400
+        provider_rows = self._get_conn().execute(
+            """
+            SELECT
+                date(occurred_at, 'unixepoch') AS day,
+                COUNT(*) AS attempts,
+                SUM(success) AS successes,
+                SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures,
+                SUM(prompt_tokens) AS prompt_tokens,
+                SUM(completion_tokens) AS completion_tokens,
+                SUM(total_tokens) AS total_tokens,
+                AVG(latency_ms) AS avg_latency_ms
+            FROM provider_request_events
+            WHERE occurred_at >= ? AND request_kind != 'model_discovery'
+            GROUP BY day
+            ORDER BY day ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        router_rows = self._get_conn().execute(
+            """
+            SELECT
+                date(occurred_at, 'unixepoch') AS day,
+                SUM(CASE WHEN failover_index > 0 THEN 1 ELSE 0 END) AS failovers
+            FROM router_request_events
+            WHERE occurred_at >= ?
+            GROUP BY day
+            ORDER BY day ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        timeline: dict[str, dict[str, object]] = {}
+        for row in provider_rows:
+            day = str(row["day"])
+            timeline[day] = {
+                "day": day,
+                "attempts": int(row["attempts"] or 0),
+                "successes": int(row["successes"] or 0),
+                "failures": int(row["failures"] or 0),
+                "failovers": 0,
+                "prompt_tokens": int(row["prompt_tokens"] or 0),
+                "completion_tokens": int(row["completion_tokens"] or 0),
+                "total_tokens": int(row["total_tokens"] or 0),
+                "avg_latency_ms": float(row["avg_latency_ms"] or 0.0),
+            }
+        for row in router_rows:
+            day = str(row["day"])
+            bucket = timeline.setdefault(
+                day,
+                {
+                    "day": day,
+                    "attempts": 0,
+                    "successes": 0,
+                    "failures": 0,
+                    "failovers": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "avg_latency_ms": 0.0,
+                },
+            )
+            bucket["failovers"] = int(row["failovers"] or 0)
+        return [timeline[key] for key in sorted(timeline)]
+
+    MODEL_META_KEYS = (
+        "input_cost_per_1m", "output_cost_per_1m", "request_cost",
+        "max_output_tokens", "rpm", "rpd", "tpm", "tpd", "rps",
+        "rate_limit_source", "meta_updated_at",
+    )
+
+    def upsert_provider_models(
+        self, provider: str, models: Iterable[tuple[str, str] | tuple[str, str, dict]]
+    ) -> None:
+        """Persist discovered/configured model ids for a provider.
+
+        Each entry is a ``(model_id, source)`` tuple (or ``(model_id, source,
+        meta)``) where ``source`` is one of ``discovery``, ``default``, or
+        ``alias`` and ``meta`` carries fetched pricing / rate-limit metadata.
+        The first-seen timestamp and source are preserved across rediscovery;
+        ``last_seen`` is bumped and metadata columns are refreshed.
+        """
+        now = time.time()
+        columns = ", ".join(self.MODEL_META_KEYS)
+        placeholders = ", ".join("?" for _ in self.MODEL_META_KEYS)
+        with self.transaction() as conn:
+            for entry in models:
+                model_id = str(entry[0])
+                source = entry[1]
+                meta = entry[2] if len(entry) > 2 else {}
+                if not model_id:
+                    continue
+                # Only rate_limit_source is NOT NULL. Keep every other missing
+                # metadata value as NULL so unknown capacity is not mistaken for zero.
+                meta_values = [
+                    "" if key == "rate_limit_source" and meta.get(key) is None else meta.get(key)
+                    for key in self.MODEL_META_KEYS
+                ]
+                meta_updated = meta.get("meta_updated_at") or now
+                meta_values[self.MODEL_META_KEYS.index("meta_updated_at")] = meta_updated
+                conn.execute(
+                    f"""
+                    INSERT INTO provider_models
+                    (provider_name, model_id, discovered_at, last_seen, source, {columns})
+                    VALUES (?, ?, ?, ?, ?, {placeholders})
+                    ON CONFLICT(provider_name, model_id) DO UPDATE SET
+                        last_seen = excluded.last_seen,
+                        input_cost_per_1m = COALESCE(excluded.input_cost_per_1m, provider_models.input_cost_per_1m),
+                        output_cost_per_1m = COALESCE(excluded.output_cost_per_1m, provider_models.output_cost_per_1m),
+                        request_cost = COALESCE(excluded.request_cost, provider_models.request_cost),
+                        max_output_tokens = COALESCE(excluded.max_output_tokens, provider_models.max_output_tokens),
+                        rpm = COALESCE(excluded.rpm, provider_models.rpm),
+                        rpd = COALESCE(excluded.rpd, provider_models.rpd),
+                        tpm = COALESCE(excluded.tpm, provider_models.tpm),
+                        tpd = COALESCE(excluded.tpd, provider_models.tpd),
+                        rps = COALESCE(excluded.rps, provider_models.rps),
+                        rate_limit_source = COALESCE(excluded.rate_limit_source, provider_models.rate_limit_source),
+                        meta_updated_at = excluded.meta_updated_at
+                    """,
+                    (provider, model_id, now, now, source, *meta_values),
+                )
+
+    def get_provider_models(self, provider: str) -> list[dict[str, object]]:
+        rows = self._get_conn().execute(
+            f"""
+            SELECT provider_name, model_id, discovered_at, last_seen, source,
+                   {", ".join(self.MODEL_META_KEYS)}
+            FROM provider_models
+            WHERE provider_name = ?
+            ORDER BY last_seen DESC, model_id
+            """,
+            (provider,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_all_provider_models(self) -> dict[str, list[dict[str, object]]]:
+        rows = self._get_conn().execute(
+            f"""
+            SELECT provider_name, model_id, discovered_at, last_seen, source,
+                   {", ".join(self.MODEL_META_KEYS)}
+            FROM provider_models
+            ORDER BY provider_name, last_seen DESC, model_id
+            """
+        ).fetchall()
+        catalog: dict[str, list[dict[str, object]]] = {}
+        for row in rows:
+            catalog.setdefault(str(row["provider_name"]), []).append(dict(row))
+        return catalog
+
+    def get_model_metrics(self, days: int = 7) -> list[dict[str, object]]:
+        """Per-(provider, model) usage rolled up from router request events."""
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT
+                provider_name,
+                model,
+                COUNT(*) AS requests,
+                SUM(success) AS successes,
+                SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures,
+                SUM(CASE WHEN failover_index > 0 THEN 1 ELSE 0 END) AS failovers,
+                SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END) AS streams,
+                SUM(CASE WHEN explicit = 1 THEN 1 ELSE 0 END) AS explicit_requests,
+                SUM(prompt_tokens) AS prompt_tokens,
+                SUM(completion_tokens) AS completion_tokens,
+                SUM(total_tokens) AS total_tokens,
+                AVG(latency_ms) AS avg_latency_ms,
+                MAX(occurred_at) AS last_used
+            FROM router_request_events
+            WHERE occurred_at >= ? AND provider_name IS NOT NULL AND model != ''
+            GROUP BY provider_name, model
+            ORDER BY requests DESC, provider_name, model
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_model_task_metrics(self, days: int = 30) -> list[dict[str, object]]:
+        """Per-(provider, model, task_kind) reliability breakdown."""
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT
+                provider_name,
+                model,
+                task_kind,
+                COUNT(*) AS attempts,
+                SUM(success) AS successes,
+                SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures,
+                AVG(latency_ms) AS avg_latency_ms,
+                MAX(occurred_at) AS last_attempt_at,
+                MAX(CASE WHEN success = 1 THEN occurred_at END) AS last_success_at,
+                MAX(CASE WHEN success = 0 THEN occurred_at END) AS last_failure_at
+            FROM router_request_events
+            WHERE occurred_at >= ? AND request_kind != 'model_discovery'
+                  AND task_kind NOT LIKE 'explicit:%'
+            GROUP BY provider_name, model, task_kind
+            ORDER BY provider_name, model, task_kind
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_model_selection(self, days: int = 30) -> list[dict[str, object]]:
+        """Which (provider, model) pairs the router selected, from decisions."""
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT
+                selected_provider AS provider_name,
+                selected_model AS model,
+                COUNT(*) AS chosen,
+                SUM(CASE WHEN explicit = 1 THEN 1 ELSE 0 END) AS explicit_chosen,
+                AVG(selected_rank) AS avg_rank,
+                AVG(selected_score) AS avg_score,
+                AVG(learned_bonus) AS avg_learned_bonus,
+                AVG(exploration_bonus) AS avg_exploration_bonus,
+                AVG(epsilon) AS avg_epsilon,
+                MAX(occurred_at) AS last_chosen_at
+            FROM routing_decisions
+            WHERE occurred_at >= ? AND selected_model != ''
+            GROUP BY selected_provider, selected_model
+            ORDER BY chosen DESC, selected_provider, selected_model
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_model_daily_usage(self, days: int = 30) -> list[dict[str, object]]:
+        """Per-(provider, model) per-day calls/tokens for timeline charts."""
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT
+                provider_name,
+                model,
+                date(occurred_at, 'unixepoch') AS day,
+                COUNT(*) AS requests,
+                SUM(success) AS successes,
+                SUM(total_tokens) AS total_tokens
+            FROM router_request_events
+            WHERE occurred_at >= ? AND provider_name IS NOT NULL AND model != ''
+            GROUP BY provider_name, model, day
+            ORDER BY day ASC, provider_name, model
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_app_event_breakdown(self, days: int = 7) -> dict[str, dict[str, int]]:
+        cutoff = time.time() - days * 86400
+        rows = self._get_conn().execute(
+            """
+            SELECT level, source, COUNT(*) AS count
+            FROM app_events
+            WHERE occurred_at >= ?
+            GROUP BY level, source
+            """,
+            (cutoff,),
+        ).fetchall()
+        levels: dict[str, int] = {}
+        sources: dict[str, int] = {}
+        for row in rows:
+            count = int(row["count"])
+            levels[row["level"]] = levels.get(row["level"], 0) + count
+            sources[row["source"]] = sources.get(row["source"], 0) + count
+        return {"levels": levels, "sources": sources}
+
+    def record_app_event(
+        self,
+        *,
+        level: str,
+        source: str,
+        message: str,
+        provider: str | None = None,
+        model: str | None = None,
+        request_id: str = "",
+        details: dict[str, object] | None = None,
+        occurred_at: float | None = None,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_events
+                (occurred_at, level, source, message, provider, model, request_id, details_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    time.time() if occurred_at is None else occurred_at,
+                    level,
+                    source,
+                    message,
+                    provider,
+                    model,
+                    request_id,
+                    _json_dumps(details or {}),
+                ),
+            )
+
+    def get_app_events(
+        self,
+        limit: int = 200,
+        *,
+        level: str | None = None,
+        provider: str | None = None,
+        request_id: str | None = None,
+        since: float | None = None,
+        levels: tuple[str, ...] = (),
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if level:
+            clauses.append("level = ?")
+            params.append(level)
+        if levels:
+            clauses.append(f"level IN ({','.join('?' for _ in levels)})")
+            params.extend(levels)
+        if provider:
+            clauses.append("provider = ?")
+            params.append(provider)
+        if request_id:
+            clauses.append("request_id = ?")
+            params.append(request_id)
+        if since is not None:
+            clauses.append("occurred_at >= ?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._get_conn().execute(
+            f"""
+            SELECT * FROM app_events
+            {where}
+            ORDER BY occurred_at DESC
+            LIMIT ?
+            """,
+            (*params, max(1, limit)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_message_log(
+        self,
+        *,
+        request_id: str = "",
+        provider: str | None,
+        model: str,
+        stream: bool,
+        explicit: bool,
+        success: bool,
+        request_kind: str = "chat",
+        response_kind: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: float = 0.0,
+        status_code: int | None = None,
+        request_json: str = "",
+        response_json: str = "",
+        error_json: str = "",
+        occurred_at: float | None = None,
+    ) -> None:
+        with self.transaction() as conn:
+            total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
+            conn.execute(
+                """
+                INSERT INTO router_message_logs
+                (request_id, occurred_at, provider_name, model, stream, explicit, success,
+                 request_kind, response_kind, prompt_tokens, completion_tokens, total_tokens,
+                 latency_ms, status_code, request_json, response_json, error_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    time.time() if occurred_at is None else occurred_at,
+                    provider,
+                    model,
+                    1 if stream else 0,
+                    1 if explicit else 0,
+                    1 if success else 0,
+                    request_kind,
+                    response_kind,
+                    max(0, prompt_tokens),
+                    max(0, completion_tokens),
+                    total_tokens,
+                    max(0.0, latency_ms),
+                    status_code,
+                    request_json,
+                    response_json,
+                    error_json,
+                ),
+            )
+
+    def get_message_logs(
+        self,
+        limit: int = 200,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        request_id: str | None = None,
+        since: float | None = None,
+        success: bool | None = None,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if provider:
+            clauses.append("provider_name = ?")
+            params.append(provider)
+        if model:
+            clauses.append("model = ?")
+            params.append(model)
+        if request_id:
+            clauses.append("request_id = ?")
+            params.append(request_id)
+        if since is not None:
+            clauses.append("occurred_at >= ?")
+            params.append(since)
+        if success is not None:
+            clauses.append("success = ?")
+            params.append(1 if success else 0)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._get_conn().execute(
+            f"""
+            SELECT * FROM router_message_logs
+            {where}
+            ORDER BY occurred_at DESC
+            LIMIT ?
+            """,
+            (*params, max(1, limit)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_kind_breakdown(self, days: int = 7) -> dict[str, dict[str, int]]:
+        cutoff = time.time() - days * 86400
+        conn = self._get_conn()
+        request_rows = conn.execute(
+            """
+            SELECT request_kind, COUNT(*) AS count
+            FROM provider_request_events
+            WHERE occurred_at >= ?
+            GROUP BY request_kind
+            """,
+            (cutoff,),
+        ).fetchall()
+        response_rows = conn.execute(
+            """
+            SELECT response_kind, COUNT(*) AS count
+            FROM provider_request_events
+            WHERE occurred_at >= ?
+            GROUP BY response_kind
+            """,
+            (cutoff,),
+        ).fetchall()
+        return {
+            "request": {row["request_kind"]: int(row["count"]) for row in request_rows},
+            "response": {row["response_kind"]: int(row["count"]) for row in response_rows},
+        }
 
     def cancel_reservation(self, reservation_id: str | None) -> None:
         if not reservation_id:
@@ -539,6 +1465,45 @@ class MetricsDB:
                 if quota.daily_token_limit is not None
                 else None
             ),
+        }
+
+    def get_quota_window_usage(self, provider: str) -> dict[str, int | float | None]:
+        quota = self.get_quota(provider)
+        if not quota:
+            return {
+                "window_start": None,
+                "window_end": None,
+                "calls_used": None,
+                "tokens_used": None,
+                "reserved_calls": None,
+                "reserved_tokens": None,
+                "requests_remaining": None,
+                "tokens_remaining": None,
+            }
+        now_ts = time.time()
+        window_start = self.quota_window_start(quota, now_ts)
+        calls, tokens, reserved_calls, reserved_tokens = self._window_usage_conn(
+            self._get_conn(), provider, quota, now_ts
+        )
+        requests_remaining = (
+            max(0, quota.daily_request_limit - calls - reserved_calls)
+            if quota.daily_request_limit is not None
+            else None
+        )
+        tokens_remaining = (
+            max(0, quota.daily_token_limit - tokens - reserved_tokens)
+            if quota.daily_token_limit is not None
+            else None
+        )
+        return {
+            "window_start": window_start,
+            "window_end": now_ts,
+            "calls_used": calls,
+            "tokens_used": tokens,
+            "reserved_calls": reserved_calls,
+            "reserved_tokens": reserved_tokens,
+            "requests_remaining": requests_remaining,
+            "tokens_remaining": tokens_remaining,
         }
 
     def get_daily_metrics(self, provider: str, days: int = 7) -> list[DailyMetrics]:
@@ -598,6 +1563,12 @@ class MetricsDB:
         with self.transaction(immediate=True) as conn:
             conn.execute("DELETE FROM provider_daily_metrics WHERE metric_date < ?", (cutoff_date,))
             conn.execute("DELETE FROM provider_request_events WHERE occurred_at < ?", (cutoff_ts,))
+            conn.execute("DELETE FROM router_request_events WHERE occurred_at < ?", (cutoff_ts,))
+            conn.execute("DELETE FROM router_message_logs WHERE occurred_at < ?", (cutoff_ts,))
+            conn.execute("DELETE FROM app_events WHERE occurred_at < ?", (cutoff_ts,))
+            conn.execute("DELETE FROM routing_decisions WHERE occurred_at < ?", (cutoff_ts,))
+            # routing_adaptation_stats intentionally remains cumulative; it is a
+            # compact per-provider/task aggregate rather than a per-request log.
             conn.execute("DELETE FROM provider_quota_reservations WHERE expires_at <= ?", (now_ts,))
 
     def close(self) -> None:
