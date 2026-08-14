@@ -10,9 +10,17 @@ import httpx
 from .config import Settings, normalize_provider
 from .provider_matrix import get_provider_matrix_entry, load_provider_matrix
 from .providers.base import (
+    ERROR_AUTHENTICATION,
+    ERROR_BILLING_OR_QUOTA,
+    ERROR_CONTEXT_LIMIT,
+    ERROR_MODEL_UNAVAILABLE,
+    ERROR_PROVIDER_UNAVAILABLE,
+    ERROR_RATE_LIMITED,
+    ERROR_REQUEST_INCOMPATIBLE,
     ProviderRequestError,
     ProviderUnavailable,
     QuotaExceededError,
+    classify_provider_error,
     classify_request_kind,
     classify_response_kind,
 )
@@ -175,6 +183,8 @@ class ZeroCostModelRouter(ModelRouter):
                 add(model_id)
 
         add(preferred)
+        if provider == "openrouter":
+            add("openrouter/free")
         add(self.settings.provider(provider).default_model)
         for route in self.settings.models.values():
             if route.provider == provider:
@@ -256,16 +266,35 @@ class ZeroCostModelRouter(ModelRouter):
     ) -> list[tuple[str, str]]:
         if not order:
             return []
-        catalog, task_rows = await self._metrics_store.run_blocking(
-            lambda db: (db.get_all_provider_models(), db.get_model_task_metrics(days=30))
+        catalog, task_rows, recent_events = await self._metrics_store.run_blocking(
+            lambda db: (
+                db.get_all_provider_models(),
+                db.get_model_task_metrics(days=30),
+                db.get_recent_router_events(limit=500),
+            )
         )
+        incompatibility_counts: dict[tuple[str, str], int] = {}
+        for event in recent_events:
+            if self._as_int(event.get("success")) != 0:
+                continue
+            if str(event.get("task_kind") or "general") != profile.kind:
+                continue
+            if self._as_int(event.get("status_code")) not in {400, 404, 413, 422}:
+                continue
+            key = (str(event.get("provider_name") or ""), str(event.get("model") or ""))
+            incompatibility_counts[key] = incompatibility_counts.get(key, 0) + 1
+
         expanded: list[tuple[str, str]] = []
         for provider, preferred in order:
             models = self._provider_model_candidates(provider, preferred, catalog)
             ranked = self._rank_model_alternatives(provider, models, profile, task_rows)
+            filtered = [
+                model for index, model in enumerate(ranked)
+                if index == 0 or incompatibility_counts.get((provider, model), 0) < 2
+            ]
             expanded.extend(
                 (provider, model)
-                for model in ranked[:MAX_MODEL_ATTEMPTS_PER_PROVIDER]
+                for model in filtered[:MAX_MODEL_ATTEMPTS_PER_PROVIDER]
             )
         return expanded
 
@@ -387,16 +416,17 @@ class ZeroCostModelRouter(ModelRouter):
             except ProviderUnavailable as exc:
                 errors.append(f"{name}/{model}: {exc}")
                 latency_ms = (time.perf_counter() - t0) * 1000
-                if exc.status_code != 413:
-                    self._mark_retryable_failure(name, exc)
-                    failed_providers.add(name)
-                else:
+                error_class = getattr(exc, "error_class", "") or classify_provider_error(exc.status_code)
+                if error_class in {ERROR_BILLING_OR_QUOTA, ERROR_CONTEXT_LIMIT}:
                     await self._record_router_event(
                         provider=name, model=model, stream=False, explicit=explicit,
                         failover_index=idx, success=False, task_kind=profile.kind,
                         request_kind=request_kind, latency_ms=latency_ms,
                         status_code=exc.status_code, request_id=request_id,
                     )
+                else:
+                    self._mark_retryable_failure(name, exc)
+                    failed_providers.add(name)
                 await self._record_message_log(
                     request_id=request_id, req=req, model=model, stream=False, explicit=explicit,
                     success=False, request_kind=request_kind, error=exc, provider=name,
@@ -407,11 +437,17 @@ class ZeroCostModelRouter(ModelRouter):
                     source="router",
                     message=f"provider {name} unavailable: {exc}",
                     provider=name, model=model, request_id=request_id,
-                    details={"status_code": exc.status_code},
+                    details={"status_code": exc.status_code, "error_class": error_class},
                 )
                 continue
             except ProviderRequestError as exc:
-                if explicit or exc.status_code != 404:
+                if explicit:
+                    raise
+                error_class = getattr(exc, "error_class", "") or classify_provider_error(exc.status_code)
+                if error_class == ERROR_AUTHENTICATION:
+                    self._mark_configuration_failure(name, exc)
+                    failed_providers.add(name)
+                elif error_class not in {ERROR_REQUEST_INCOMPATIBLE, ERROR_MODEL_UNAVAILABLE}:
                     raise
                 errors.append(f"{name}/{model}: {exc}")
                 latency_ms = (time.perf_counter() - t0) * 1000
@@ -431,7 +467,7 @@ class ZeroCostModelRouter(ModelRouter):
                     source="router",
                     message=f"provider {name} request failed: {exc}",
                     provider=name, model=model, request_id=request_id,
-                    details={"status_code": exc.status_code},
+                    details={"status_code": exc.status_code, "error_class": error_class},
                 )
                 continue
             latency_ms = (time.perf_counter() - t0) * 1000
@@ -580,7 +616,9 @@ class ZeroCostModelRouter(ModelRouter):
             except ProviderUnavailable as exc:
                 latency_ms = (time.perf_counter() - t0) * 1000
                 if emitted:
-                    self._mark_retryable_failure(name, exc)
+                    error_class = getattr(exc, "error_class", "") or classify_provider_error(exc.status_code)
+                    if error_class in {ERROR_PROVIDER_UNAVAILABLE, ERROR_RATE_LIMITED}:
+                        self._mark_retryable_failure(name, exc)
                     await self._record_router_event(
                         provider=name, model=model, stream=True, explicit=explicit,
                         failover_index=idx, success=False, task_kind=profile.kind,
@@ -600,16 +638,17 @@ class ZeroCostModelRouter(ModelRouter):
                     )
                     raise
                 errors.append(f"{name}/{model}: {exc}")
-                if exc.status_code != 413:
-                    self._mark_retryable_failure(name, exc)
-                    failed_providers.add(name)
-                else:
+                error_class = getattr(exc, "error_class", "") or classify_provider_error(exc.status_code)
+                if error_class in {ERROR_BILLING_OR_QUOTA, ERROR_CONTEXT_LIMIT}:
                     await self._record_router_event(
                         provider=name, model=model, stream=True, explicit=explicit,
                         failover_index=idx, success=False, task_kind=profile.kind,
                         request_kind=request_kind, latency_ms=latency_ms,
                         status_code=exc.status_code, request_id=request_id,
                     )
+                else:
+                    self._mark_retryable_failure(name, exc)
+                    failed_providers.add(name)
                 await self._record_message_log(
                     request_id=request_id, req=req, model=model, stream=True, explicit=explicit,
                     success=False, request_kind=request_kind, error=exc, provider=name,
@@ -620,11 +659,17 @@ class ZeroCostModelRouter(ModelRouter):
                     source="router",
                     message=f"provider {name} stream unavailable: {exc}",
                     provider=name, model=model, request_id=request_id,
-                    details={"status_code": exc.status_code},
+                    details={"status_code": exc.status_code, "error_class": error_class},
                 )
                 continue
             except ProviderRequestError as exc:
-                if emitted or explicit or exc.status_code != 404:
+                if emitted or explicit:
+                    raise
+                error_class = getattr(exc, "error_class", "") or classify_provider_error(exc.status_code)
+                if error_class == ERROR_AUTHENTICATION:
+                    self._mark_configuration_failure(name, exc)
+                    failed_providers.add(name)
+                elif error_class not in {ERROR_REQUEST_INCOMPATIBLE, ERROR_MODEL_UNAVAILABLE}:
                     raise
                 errors.append(f"{name}/{model}: {exc}")
                 latency_ms = (time.perf_counter() - t0) * 1000
@@ -644,7 +689,7 @@ class ZeroCostModelRouter(ModelRouter):
                     source="router",
                     message=f"provider {name} stream failed: {exc}",
                     provider=name, model=model, request_id=request_id,
-                    details={"status_code": exc.status_code},
+                    details={"status_code": exc.status_code, "error_class": error_class},
                 )
                 continue
 
@@ -670,12 +715,25 @@ class ZeroCostModelRouter(ModelRouter):
         )
         raise ProviderUnavailable("all zero-cost providers failed: " + "; ".join(errors))
 
+    def _mark_configuration_failure(self, name: str, exc: BaseException) -> None:
+        status = self.status.get(name)
+        if status is None:
+            return
+        status.available = False
+        status.last_error = str(exc)[:200]
+        status.last_error_class = getattr(exc, "error_class", "") or classify_provider_error(
+            getattr(exc, "status_code", None)
+        )
+        status.last_polled = time.time()
+        status.backoff_until = 0.0
+
     def _mark_quota_exhausted(self, name: str) -> None:
         status = self.status.get(name)
         if status is None:
             return
         status.daily_calls_remaining = 0
         status.last_error = "local quota guard exhausted"
+        status.last_error_class = ERROR_RATE_LIMITED
         status.last_polled = time.time()
 
     def _mark_provider_failure(self, name: str, exc: BaseException) -> None:

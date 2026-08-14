@@ -79,6 +79,8 @@ def test_dashboard_client_uses_non_overlapping_live_refresh_and_provider_recover
     assert "IntersectionObserver" in script
     assert "provider.in_backoff" in script
     assert "provider.consecutive_failures" in script
+    assert "provider.last_error_class" in script
+    assert "event.error_class" in script
     assert "/dashboard/api?days=" in script
 
 
