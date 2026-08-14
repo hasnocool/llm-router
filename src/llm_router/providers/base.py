@@ -137,7 +137,9 @@ class ProviderRequestError(Exception):
 
 class QuotaExceededError(ProviderRequestError):
     def __init__(self, message: str, provider: str):
-        super().__init__(message, status_code=429)
+        super().__init__(
+            message, status_code=429, error_class=ERROR_BILLING_OR_QUOTA
+        )
         self.provider = provider
 
 

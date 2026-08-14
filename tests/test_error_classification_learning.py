@@ -189,3 +189,20 @@ async def test_repeated_model_task_incompatibility_skips_nonpreferred_alternativ
         assert ("groq", "known-bad") not in expanded
         assert ("groq", "known-good") in expanded
         await router._metrics_store.close()
+
+
+def test_zero_cost_failure_state_keeps_exact_classification(tmp_path):
+    import asyncio
+
+    async def run():
+        async with httpx.AsyncClient() as client:
+            router = ZeroCostModelRouter(settings(tmp_path), client)
+            router._mark_provider_failure(
+                "groq", ProviderUnavailable("upstream unavailable", status_code=503)
+            )
+            assert router.status["groq"].last_error_class == ERROR_PROVIDER_UNAVAILABLE
+            router._mark_quota_exhausted("groq")
+            assert router.status["groq"].last_error_class == ERROR_BILLING_OR_QUOTA
+            await router._metrics_store.close()
+
+    asyncio.run(run())

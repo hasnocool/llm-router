@@ -733,7 +733,7 @@ class ZeroCostModelRouter(ModelRouter):
             return
         status.daily_calls_remaining = 0
         status.last_error = "local quota guard exhausted"
-        status.last_error_class = ERROR_RATE_LIMITED
+        status.last_error_class = ERROR_BILLING_OR_QUOTA
         status.last_polled = time.time()
 
     def _mark_provider_failure(self, name: str, exc: BaseException) -> None:
@@ -742,6 +742,9 @@ class ZeroCostModelRouter(ModelRouter):
             return
         now = time.time()
         status.last_error = str(exc)[:200]
+        status.last_error_class = getattr(exc, "error_class", "") or classify_provider_error(
+            getattr(exc, "status_code", None)
+        )
         status.last_polled = now
         status.consecutive_failures += 1
 
