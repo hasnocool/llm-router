@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
+ROOT = Path(__file__).resolve().parents[1]
 TARGET = Path(__file__).with_name("repair_pr9_round2.py")
 
 
@@ -27,8 +28,18 @@ def main() -> None:
     replacement = replacement[:-2] + "        2,\n    )\n"
     text = text.replace(duplicated, replacement, 1)
     text = text.replace(duplicated, "", 1)
-
     TARGET.write_text(text, encoding="utf-8")
+
+    test_path = ROOT / "tests/test_task_classifier.py"
+    test_text = test_path.read_text(encoding="utf-8")
+    old_test = '''            order = await router._order_for_request(ChatRequest(model="auto", messages=[Message(role="user", content="hello")]))\n            assert called["count"] == 1\n            assert order[0][0] in {"groq", "openrouter"}\n'''
+    new_test = '''            order, profile = await router._order_for_request(ChatRequest(model="auto", messages=[Message(role="user", content="hello")]))\n            assert called["count"] == 1\n            assert profile.kind == "coding"\n            assert profile.coding_heavy is True\n            assert order[0][0] in {"groq", "openrouter"}\n'''
+    count = test_text.count(old_test)
+    if count != 1:
+        raise RuntimeError(
+            f"tests/test_task_classifier.py: expected one signature assertion block, found {count}"
+        )
+    test_path.write_text(test_text.replace(old_test, new_test, 1), encoding="utf-8")
 
 
 if __name__ == "__main__":
