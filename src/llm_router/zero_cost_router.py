@@ -139,11 +139,14 @@ class ZeroCostModelRouter(ModelRouter):
                 merged.append(name)
         return merged or names
 
-    async def _order_for_request(self, req: ChatRequest) -> list[tuple[str, str]]:
+    async def _order_for_request(
+        self, req: ChatRequest
+    ) -> tuple[list[tuple[str, str]], TaskProfile]:
         if self.settings.strategy != "zero-cost":
-            return self._order(req)
+            profile = TaskProfile(kind="general", confidence=1.0)
+            return self._order(req), profile
         profile = await self._task_profile(req)
-        return self._order_with_profile(req, profile)
+        return self._order_with_profile(req, profile), profile
 
     def _order_with_profile(self, req: ChatRequest, profile: TaskProfile) -> list[tuple[str, str]]:
         if self.settings.strategy != "zero-cost":
@@ -224,14 +227,13 @@ class ZeroCostModelRouter(ModelRouter):
             return await super().complete(req)
 
         errors: list[str] = []
-        order = await self._order_for_request(req)
+        order, profile = await self._order_for_request(req)
         if not order:
             raise ProviderUnavailable("no zero-cost providers are currently eligible")
 
         request_kind = classify_request_kind({"tools": req.tools, "tool_choice": req.tool_choice})
         explicit = self._is_explicit(req)
         request_id = uuid.uuid4().hex[:16]
-        profile = await self._task_profile(req)
         await self._log_event(
             level="info",
             source="router",
@@ -360,14 +362,13 @@ class ZeroCostModelRouter(ModelRouter):
             return
 
         errors: list[str] = []
-        order = await self._order_for_request(req)
+        order, profile = await self._order_for_request(req)
         if not order:
             raise ProviderUnavailable("no zero-cost providers are currently eligible")
 
         request_kind = classify_request_kind({"tools": req.tools, "tool_choice": req.tool_choice})
         explicit = self._is_explicit(req)
         request_id = uuid.uuid4().hex[:16]
-        profile = await self._task_profile(req)
         await self._log_event(
             level="info",
             source="router",

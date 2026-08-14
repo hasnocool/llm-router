@@ -1,6 +1,7 @@
 const REFRESH_MS = 5000;
 let state = null;
 let timer = null;
+let loadVersion = 0;
 
 const el = (tag, cls, text) => {
   const node = document.createElement(tag);
@@ -41,6 +42,7 @@ function populateProviders() {
 }
 
 async function load() {
+  const version = ++loadVersion;
   const q = new URLSearchParams({
     days: document.getElementById("days").value,
     limit: document.getElementById("limit").value,
@@ -55,13 +57,16 @@ async function load() {
   try {
     const resp = await fetch("/logs/api?" + q.toString());
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    state = await resp.json();
+    const nextState = await resp.json();
+    if (version !== loadVersion) return;
+    state = nextState;
     populateProviders();
     renderEvents();
     renderMessages();
     status.textContent = "ok";
     status.className = "status fresh";
   } catch (err) {
+    if (version !== loadVersion) return;
     status.textContent = "error: " + err.message;
     status.className = "status stale";
   }

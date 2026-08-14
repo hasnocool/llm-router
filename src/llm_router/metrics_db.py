@@ -354,45 +354,6 @@ class MetricsDB:
         for column, decl in model_columns.items():
             if column not in model_cols:
                 conn.execute(f"ALTER TABLE provider_models ADD COLUMN {column} {decl}")
-        decisions_cols = {row["name"] for row in conn.execute("PRAGMA table_info(routing_decisions)")}
-        if not decisions_cols:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS routing_decisions ("
-                "request_id TEXT PRIMARY KEY,"
-                "occurred_at REAL NOT NULL,"
-                "task_kind TEXT NOT NULL DEFAULT 'general',"
-                "request_kind TEXT NOT NULL DEFAULT 'chat',"
-                "explicit INTEGER NOT NULL DEFAULT 0,"
-                "selected_provider TEXT,"
-                "selected_model TEXT NOT NULL DEFAULT '',"
-                "selected_rank INTEGER NOT NULL DEFAULT 0,"
-                "selected_score REAL NOT NULL DEFAULT 0,"
-                "learned_bonus REAL NOT NULL DEFAULT 0,"
-                "exploration_bonus REAL NOT NULL DEFAULT 0,"
-                "candidate_json TEXT NOT NULL DEFAULT '[]',"
-                "epsilon REAL NOT NULL DEFAULT 0,"
-                "notes TEXT NOT NULL DEFAULT '',"
-                "created_at REAL NOT NULL DEFAULT 0"
-                ")"
-            )
-        adapt_cols = {row["name"] for row in conn.execute("PRAGMA table_info(routing_adaptation_stats)")}
-        if not adapt_cols:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS routing_adaptation_stats ("
-                "provider_name TEXT NOT NULL,"
-                "task_kind TEXT NOT NULL DEFAULT 'general',"
-                "attempts INTEGER NOT NULL DEFAULT 0,"
-                "successes INTEGER NOT NULL DEFAULT 0,"
-                "failures INTEGER NOT NULL DEFAULT 0,"
-                "total_reward REAL NOT NULL DEFAULT 0,"
-                "total_latency_ms REAL NOT NULL DEFAULT 0,"
-                "latency_count INTEGER NOT NULL DEFAULT 0,"
-                "last_attempt_at REAL NOT NULL DEFAULT 0,"
-                "last_success_at REAL NOT NULL DEFAULT 0,"
-                "last_failure_at REAL NOT NULL DEFAULT 0,"
-                "PRIMARY KEY(provider_name, task_kind)"
-                ")"
-            )
         if "task_kind" not in router_cols:
             conn.execute(
                 "ALTER TABLE router_request_events "
@@ -929,7 +890,7 @@ class MetricsDB:
                 MIN(latency_ms) AS min_latency_ms,
                 MAX(latency_ms) AS max_latency_ms
             FROM provider_request_events
-            WHERE occurred_at >= ?
+            WHERE occurred_at >= ? AND request_kind != 'model_discovery'
             GROUP BY provider_name
             ORDER BY attempts DESC, provider_name
             """,
@@ -1024,7 +985,7 @@ class MetricsDB:
                 SUM(total_tokens) AS total_tokens,
                 AVG(latency_ms) AS avg_latency_ms
             FROM provider_request_events
-            WHERE occurred_at >= ?
+            WHERE occurred_at >= ? AND request_kind != 'model_discovery'
             GROUP BY day
             ORDER BY day ASC
             """,
@@ -1102,18 +1063,12 @@ class MetricsDB:
                 meta = entry[2] if len(entry) > 2 else {}
                 if not model_id:
                     continue
-                meta_values = [meta.get(key) for key in self.MODEL_META_KEYS]
-                # Defaulting logic - ensure all NOT NULL columns have values
-                for i, key in enumerate(self.MODEL_META_KEYS):
-                    if meta_values[i] is None:
-                        if key == "rate_limit_source":
-                            meta_values[i] = ""
-                        elif key in ("input_cost_per_1m", "output_cost_per_1m", "request_cost", "meta_updated_at"):
-                            meta_values[i] = None # These allow NULL
-                        else:
-                            # INTEGER columns: max_output_tokens, rpm, rpd, tpm, tpd, rps
-                            meta_values[i] = 0
-                
+                # Only rate_limit_source is NOT NULL. Keep every other missing
+                # metadata value as NULL so unknown capacity is not mistaken for zero.
+                meta_values = [
+                    "" if key == "rate_limit_source" and meta.get(key) is None else meta.get(key)
+                    for key in self.MODEL_META_KEYS
+                ]
                 meta_updated = meta.get("meta_updated_at") or now
                 meta_values[self.MODEL_META_KEYS.index("meta_updated_at")] = meta_updated
                 conn.execute(
@@ -1611,6 +1566,9 @@ class MetricsDB:
             conn.execute("DELETE FROM router_request_events WHERE occurred_at < ?", (cutoff_ts,))
             conn.execute("DELETE FROM router_message_logs WHERE occurred_at < ?", (cutoff_ts,))
             conn.execute("DELETE FROM app_events WHERE occurred_at < ?", (cutoff_ts,))
+            conn.execute("DELETE FROM routing_decisions WHERE occurred_at < ?", (cutoff_ts,))
+            # routing_adaptation_stats intentionally remains cumulative; it is a
+            # compact per-provider/task aggregate rather than a per-request log.
             conn.execute("DELETE FROM provider_quota_reservations WHERE expires_at <= ?", (now_ts,))
 
     def close(self) -> None:

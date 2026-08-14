@@ -63,6 +63,8 @@ class DBEventLogHandler(logging.Handler):
     """Handler that forwards formatted log records into the buffered event log."""
 
     def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, "skip_event_buffer", False):
+            return
         details: dict[str, Any] = {}
         if record.exc_info:
             details["exc"] = self.formatter.formatException(record.exc_info) if self.formatter else None

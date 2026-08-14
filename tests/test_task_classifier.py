@@ -73,8 +73,10 @@ def test_low_confidence_can_trigger_model_fallback(monkeypatch):
 
             monkeypatch.setattr("llm_router.zero_cost_router.refine_task_profile_with_model", fake_refine)
             monkeypatch.setattr("llm_router.zero_cost_router.classify_task", lambda payload: TaskProfile(kind="general", confidence=0.2))
-            order = await router._order_for_request(ChatRequest(model="auto", messages=[Message(role="user", content="hello")]))
+            order, profile = await router._order_for_request(ChatRequest(model="auto", messages=[Message(role="user", content="hello")]))
             assert called["count"] == 1
+            assert profile.kind == "coding"
+            assert profile.coding_heavy is True
             assert order[0][0] in {"groq", "openrouter"}
 
     import asyncio

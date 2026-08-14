@@ -148,7 +148,7 @@ class Provider:
             try:
                 await resp.aread()
                 body = resp.text[:2000]
-            except (httpx.ResponseNotRead, httpx.DecodingError, UnicodeError):
+            except (httpx.HTTPError, httpx.StreamError, UnicodeError):
                 body = ""
             raise ProviderRequestError(
                 f"{self.name} returned HTTP {resp.status_code}",

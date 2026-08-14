@@ -1,6 +1,7 @@
 const REFRESH_MS = 5000;
 let state = null;
 let charts = {};
+let loadVersion = 0;
 
 const fmt = (n) => n == null ? "N/A" : n.toLocaleString();
 const ms = (n) => n == null ? "-" : `${n.toFixed(n < 10 ? 2 : 1)}ms`;
@@ -29,17 +30,21 @@ function tick() {
 }
 
 async function load() {
+  const version = ++loadVersion;
   const days = document.getElementById("days").value;
   document.getElementById("status").textContent = "loading…";
   document.getElementById("status").className = "status";
   try {
     const resp = await fetch(`/dashboard/api?days=${days}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    state = await resp.json();
+    const nextState = await resp.json();
+    if (version !== loadVersion) return;
+    state = nextState;
     render();
     document.getElementById("status").textContent = "ok";
     document.getElementById("status").className = "status fresh";
   } catch (err) {
+    if (version !== loadVersion) return;
     document.getElementById("status").textContent = "error: " + err.message;
     document.getElementById("status").className = "status stale";
   }

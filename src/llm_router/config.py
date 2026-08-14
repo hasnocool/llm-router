@@ -57,7 +57,7 @@ class LogsConfig:
     file_path: str | None = None
     max_bytes: int = 10 * 1024 * 1024
     backup_count: int = 5
-    log_message_bodies: bool = True
+    log_message_bodies: bool = False
     max_body_chars: int = 120_000
 
 
@@ -222,7 +222,7 @@ def load_settings(
         log_message_bodies=_env_bool(
             resolved_env,
             "LLM_ROUTER_LOG_MESSAGE_BODIES",
-            logs_raw.get("log_message_bodies", True),
+            logs_raw.get("log_message_bodies", False),
         ),
         max_body_chars=logs_raw.get("max_body_chars", 120_000),
     )

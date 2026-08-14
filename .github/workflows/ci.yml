@@ -7,28 +7,19 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref || github.ref }}
-          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
       - name: Install project and QA tools
         run: python -m pip install -e '.[dev]' ruff pyright
-      - name: Repair PR #9 review harness
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 9
-        run: python scripts/fix_repair_pr9_round2.py
-      - name: Apply second PR #9 review repair pass
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 9
-        run: python scripts/repair_pr9_round2.py
       - name: Compile
         run: python -m compileall -q src tests
       - name: Ruff critical checks
@@ -37,17 +28,3 @@ jobs:
         run: pytest -q
       - name: Pyright
         run: pyright src
-      - name: Commit verified PR #9 review repairs
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 9 && github.actor != 'github-actions[bot]'
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git checkout origin/main -- .github/workflows/ci.yml
-          git rm -f scripts/repair_pr9_round2.py scripts/fix_repair_pr9_round2.py
-          git add -A
-          if git diff --cached --quiet; then
-            echo 'No repair changes to commit.'
-            exit 0
-          fi
-          git commit -m 'fix: address remaining PR review findings'
-          git push origin HEAD:fix-metrics-seeding

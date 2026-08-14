@@ -191,15 +191,10 @@ class GoogleAIProvider(Provider):
             "maxItems",
             "minProperties",
             "maxProperties",
-            "uniqueItems",
             "items",
-            "prefixItems",
             "properties",
             "required",
             "anyOf",
-            "oneOf",
-            "allOf",
-            "not",
         }
         if isinstance(schema, dict):
             cleaned: dict[str, Any] = {}

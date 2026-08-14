@@ -147,11 +147,11 @@ class ModelRouter:
                             details=event.get("details"),
                         )
                     except Exception:
-                        logging.getLogger(__name__).exception("failed to persist event log entry")
+                        logger.exception("failed to persist event log entry", extra={"skip_event_buffer": True})
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logging.getLogger(__name__).warning("event log drain failed: %s", exc)
+                logger.warning("event log drain failed: %s", exc, extra={"skip_event_buffer": True})
 
     async def _record_app_event(
         self,
@@ -175,7 +175,7 @@ class ModelRouter:
                 details=details,
             )
         except Exception:
-            logging.getLogger(__name__).exception("app event recording failed")
+            logger.exception("app event recording failed", extra={"skip_event_buffer": True})
 
     async def _log_event(
         self,
@@ -193,13 +193,18 @@ class ModelRouter:
         token = attach_event_context(
             provider=provider, model=model, request_id=request_id
         )
-        record_fn = getattr(logging, level.lower(), None)
+        level_no = {
+            "debug": logging.DEBUG,
+            "info": logging.INFO,
+            "warning": logging.WARNING,
+            "error": logging.ERROR,
+            "critical": logging.CRITICAL,
+        }.get(level.lower(), logging.INFO)
         try:
-            if callable(record_fn):
-                extra: dict[str, object] = {"source": source}
-                if details:
-                    extra["details"] = details
-                record_fn("%s", message, extra=extra)
+            extra: dict[str, object] = {"source": source}
+            if details:
+                extra["details"] = details
+            logger.log(level_no, "%s", message, extra=extra)
         finally:
             reset_event_context(token)
 
@@ -338,9 +343,16 @@ class ModelRouter:
             obj = json.loads(payload)
         except json.JSONDecodeError:
             return False
-        for choice in obj.get("choices") or []:
-            delta = choice.get("delta") or {}
-            if delta.get("tool_calls"):
+        if not isinstance(obj, dict):
+            return False
+        choices = obj.get("choices")
+        if not isinstance(choices, list):
+            return False
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if isinstance(delta, dict) and delta.get("tool_calls"):
                 return True
         return False
 
@@ -380,17 +392,37 @@ class ModelRouter:
                 request_id=request_id,
             )
         except Exception:
-            logging.getLogger(__name__).exception("router event recording failed")
+            logger.exception("router event recording failed", extra={"skip_event_buffer": True})
 
     @staticmethod
     def _json_body(value: object, max_chars: int = 4_000) -> str:
         try:
             raw = json.dumps(value, ensure_ascii=False, default=str)
         except (TypeError, ValueError):
-            raw = str(value)
-        if len(raw) > max_chars:
-            raw = raw[:max_chars] + '..."(truncated)'
-        return raw
+            raw = json.dumps(str(value), ensure_ascii=False)
+        if len(raw) <= max_chars:
+            return raw
+        if max_chars < 2:
+            return "0"
+
+        def encoded_preview(length: int) -> str:
+            return json.dumps(
+                {"truncated": True, "preview": raw[:length]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+        low, high = 0, min(len(raw), max_chars)
+        best = "0"
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = encoded_preview(mid)
+            if len(candidate) <= max_chars:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best
 
     def _message_log_request(self, req: ChatRequest) -> dict[str, Any]:
         return {"model": req.model, "messages": [m.model_dump(exclude_none=True) for m in req.messages]}
@@ -442,7 +474,7 @@ class ModelRouter:
                 error_json=error_json,
             )
         except Exception:
-            logging.getLogger(__name__).exception("message log recording failed")
+            logger.exception("message log recording failed", extra={"skip_event_buffer": True})
 
     def _order(self, req: ChatRequest) -> list[tuple[str, str]]:
         local_first = req.local_first if req.local_first is not None else self.settings.strategy == "local-first"

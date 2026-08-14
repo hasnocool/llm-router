@@ -105,8 +105,9 @@ level = "INFO"
 file_path = "logs/router.log"
 max_bytes = 10485760
 backup_count = 5
-# Persist request/response message bodies to the dashboard message log.
-log_message_bodies = true
+# Persist full request/response bodies only when explicitly enabled for local debugging.
+# Bodies may contain private or personal data.
+log_message_bodies = false
 max_body_chars = 120000
 
 [analytics]
