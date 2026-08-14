@@ -265,7 +265,12 @@ def runtime_route_score(
 
     if status is not None:
         if status.last_polled > 0 and not status.available:
-            reasons.append("unavailable")
+            # Tiered failures only hard-block a route during its active
+            # cooldown. Once the cooldown expires, allow a probe request so a
+            # recovered provider can self-heal without a process restart.
+            backoff_until = float(getattr(status, "backoff_until", 0.0) or 0.0)
+            if backoff_until > time.time():
+                reasons.append("unavailable")
 
         if status.rate_limit_remaining == 0:
             reset = status.rate_limit_reset

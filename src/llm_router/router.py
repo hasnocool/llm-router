@@ -30,6 +30,11 @@ from .schemas import ChatMessage, ChatRequest, ChatResponse, ChatUsage, Choice, 
 
 logger = logging.getLogger(__name__)
 
+PROVIDER_FAILURE_THRESHOLD = 3
+PROVIDER_BACKOFF_BASE_SECONDS = 300.0
+PROVIDER_BACKOFF_MAX_SECONDS = 3600.0
+PROVIDER_RATE_LIMIT_BACKOFF_SECONDS = 60.0
+
 
 @dataclass
 class ProviderStatus:
@@ -47,6 +52,8 @@ class ProviderStatus:
     rate_limit_reset: int | None = None
     latency_p50_ms: float = 0.0
     latency_p99_ms: float = 0.0
+    consecutive_failures: int = 0
+    backoff_until: float = 0.0
 
 
 class ModelRouter:
@@ -288,31 +295,67 @@ class ModelRouter:
         self._model_backoff_until[name] = 0.0
         self._model_cache[name] = (now, models)
         status = self.status[name]
-        status.available = True
         status.model_count = len(models)
-        status.latency_ms = (time.perf_counter() - t0) * 1000
-        status.last_error = ""
-        status.last_polled = time.time()
+        self._mark_provider_success(name, (time.perf_counter() - t0) * 1000)
         return models
 
     def _mark_provider_success(self, name: str, latency_ms: float) -> None:
         status = self.status[name]
         status.available = True
+        status.consecutive_failures = 0
+        status.backoff_until = 0.0
         status.latency_ms = latency_ms
         status.last_error = ""
         status.last_polled = time.time()
 
     def _mark_provider_failure(self, name: str, exc: BaseException) -> None:
         status = self.status[name]
+        now = time.time()
         status.last_error = str(exc)[:200]
-        status.last_polled = time.time()
-        if not isinstance(exc, ProviderUnavailable) or exc.status_code != 429:
+        status.last_polled = now
+        status.consecutive_failures += 1
+
+        # A provider that explicitly rate-limits us should be cooled down
+        # immediately. Other transient failures get two chances before the
+        # provider is removed from automatic routing.
+        if isinstance(exc, ProviderUnavailable) and exc.status_code == 429:
+            retry_at = exc.retry_after_until
+            fallback = now + PROVIDER_RATE_LIMIT_BACKOFF_SECONDS
             status.available = False
+            status.backoff_until = max(
+                status.backoff_until,
+                float(retry_at) if retry_at is not None and retry_at > now else fallback,
+            )
+            return
+
+        if status.consecutive_failures < PROVIDER_FAILURE_THRESHOLD:
+            return
+
+        exponent = min(status.consecutive_failures - PROVIDER_FAILURE_THRESHOLD, 8)
+        delay = min(
+            PROVIDER_BACKOFF_MAX_SECONDS,
+            PROVIDER_BACKOFF_BASE_SECONDS * (2 ** exponent),
+        )
+        status.available = False
+        status.backoff_until = max(status.backoff_until, now + delay)
+
+    def _provider_in_backoff(self, name: str, *, now: float | None = None) -> bool:
+        status = self.status.get(name)
+        if status is None:
+            return False
+        current = time.time() if now is None else now
+        return status.backoff_until > current
 
     def ranked_providers(self) -> list[ProviderStatus]:
+        now = time.time()
         return sorted(
             self.status.values(),
-            key=lambda status: (status.available, status.model_count, -status.latency_ms),
+            key=lambda status: (
+                status.backoff_until <= now,
+                status.available,
+                status.model_count,
+                -status.latency_ms,
+            ),
             reverse=True,
         )
 
@@ -328,9 +371,18 @@ class ModelRouter:
             return [n for n in self.settings.routing_providers if n in self.providers]
         return list(self.providers.keys())
 
+    def _explicit_provider(self, req: ChatRequest) -> str | None:
+        if req.provider:
+            return normalize_provider(req.provider)
+        model = req.model or ""
+        if ":" in model:
+            provider_hint = normalize_provider(model.partition(":")[0])
+            return provider_hint if provider_hint in self.providers else None
+        provider_name = normalize_provider(model)
+        return provider_name if provider_name in self.providers else None
+
     def _is_explicit(self, req: ChatRequest) -> bool:
-        colon_provider = req.model.partition(":")[0] if ":" in req.model else None
-        return bool(req.provider or normalize_provider(colon_provider) in self.providers)
+        return self._explicit_provider(req) is not None
 
     @staticmethod
     def _sse_has_tool_call(line: str) -> bool:
@@ -479,12 +531,9 @@ class ModelRouter:
     def _order(self, req: ChatRequest) -> list[tuple[str, str]]:
         local_first = req.local_first if req.local_first is not None else self.settings.strategy == "local-first"
         available = list(self.providers.keys())
-        colon_provider = req.model.partition(":")[0] if ":" in req.model else None
-        explicit = req.provider or (
-            colon_provider if normalize_provider(colon_provider) in self.providers else None
-        )
+        explicit = self._explicit_provider(req)
         if explicit:
-            name = normalize_provider(explicit)
+            name = explicit
             if name not in self.providers:
                 raise ProviderRequestError(f"unknown provider: {name}", status_code=400)
             if ":" in req.model:
@@ -501,7 +550,10 @@ class ModelRouter:
         if not req.model or req.model.lower() in {"auto", "best", "*"}:
             pool = self._routing_pool()
             ranked = self.ranked_providers()
-            candidates = [n for n in pool if n in available]
+            candidates = [
+                n for n in pool
+                if n in available and not self._provider_in_backoff(n)
+            ]
             order_names = [
                 s.name
                 for s in ranked
@@ -525,9 +577,14 @@ class ModelRouter:
         # pool is used for fallback so off-limit providers never receive traffic.
         pool = self._routing_pool()
         ranked = self.ranked_providers()
-        order_names = [primary]
+        order_names = [] if self._provider_in_backoff(primary) else [primary]
         for s in ranked:
-            if s.name != primary and s.name in available and s.name in pool:
+            if (
+                s.name != primary
+                and s.name in available
+                and s.name in pool
+                and not self._provider_in_backoff(s.name)
+            ):
                 order_names.append(s.name)
         if local_first:
             order_names = sorted(order_names, key=lambda name: name != "local")
@@ -1204,6 +1261,9 @@ class ModelRouter:
                 "rate_limit_reset": status.rate_limit_reset,
                 "latency_p50_ms": status.latency_p50_ms,
                 "latency_p99_ms": status.latency_p99_ms,
+                "consecutive_failures": status.consecutive_failures,
+                "backoff_until": status.backoff_until,
+                "in_backoff": self._provider_in_backoff(name),
                 "rate_limits": [
                     {
                         "type": item.limit_type,
