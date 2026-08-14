@@ -3,122 +3,249 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>llm-router dashboard</title>
+<meta name="color-scheme" content="dark">
+<title>llm-router control center</title>
 <link rel="stylesheet" href="/static/dashboard.css">
 <script src="/static/vendor/chart.umd.min.js"></script>
 </head>
 <body>
-<header>
-  <h1>llm-router <span id="strategy" class="badge"></span></h1>
-  <div class="controls">
-    <a class="navlink" href="/logs">Logs</a>
-    <label class="toggle">
-      <input type="checkbox" id="autorefresh" checked>
-      Auto-refresh (5s)
-    </label>
-    <span id="status" class="status"></span>
-    <span id="updated" class="updated"></span>
+<div class="app-shell">
+  <aside class="sidebar" aria-label="Dashboard navigation">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">LR</div>
+      <div>
+        <div class="brand-name">llm-router</div>
+        <div class="brand-subtitle">Control center</div>
+      </div>
+    </div>
+
+    <nav class="side-nav">
+      <a class="side-link active" href="#overview" data-section="overview"><span>01</span>Overview</a>
+      <a class="side-link" href="#providers-section" data-section="providers-section"><span>02</span>Providers</a>
+      <a class="side-link" href="#routing-section" data-section="routing-section"><span>03</span>Routing</a>
+      <a class="side-link" href="#analytics-section" data-section="analytics-section"><span>04</span>Analytics</a>
+      <a class="side-link" href="#activity-section" data-section="activity-section"><span>05</span>Activity</a>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="eyebrow">Routing strategy</div>
+      <div id="strategy" class="strategy-pill">loading</div>
+      <a class="secondary-link" href="/logs">Open detailed logs →</a>
+    </div>
+  </aside>
+
+  <div class="workspace">
+    <header class="topbar">
+      <div class="topbar-copy">
+        <div class="eyebrow">Operations</div>
+        <h1>Routing control center</h1>
+      </div>
+      <div class="toolbar" aria-label="Dashboard controls">
+        <div class="connection" title="Dashboard API status">
+          <span id="status-dot" class="connection-dot loading"></span>
+          <span id="status" class="status">connecting</span>
+        </div>
+        <label class="control-field">
+          <span>Window</span>
+          <select id="days" aria-label="Reporting window">
+            <option value="7">7 days</option>
+            <option value="30">30 days</option>
+            <option value="90">90 days</option>
+          </select>
+        </label>
+        <label class="switch-control">
+          <input type="checkbox" id="autorefresh" checked>
+          <span class="switch" aria-hidden="true"></span>
+          <span>Live</span>
+        </label>
+        <button id="refresh-now" class="button" type="button">Refresh</button>
+        <span id="updated" class="updated">not updated</span>
+      </div>
+    </header>
+
+    <main class="content">
+      <section id="overview" class="section-block" aria-labelledby="overview-title">
+        <div class="section-heading hero-heading">
+          <div>
+            <div class="eyebrow">System overview</div>
+            <h2 id="overview-title">What the router is doing right now</h2>
+            <p>Current traffic, routing health, quota pressure, and cost in one operational view.</p>
+          </div>
+          <div id="health-badge" class="health-badge neutral">Assessing health</div>
+        </div>
+
+        <div id="summary" class="metric-grid" aria-live="polite"></div>
+
+        <div class="dashboard-grid overview-grid">
+          <article class="panel span-2">
+            <div class="panel-heading">
+              <div>
+                <div class="eyebrow">Throughput</div>
+                <h3>Requests by provider</h3>
+              </div>
+            </div>
+            <div class="chart chart-large"><canvas id="chart-calls"></canvas></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <div class="eyebrow">Latency</div>
+                <h3>Median response time</h3>
+              </div>
+            </div>
+            <div class="chart"><canvas id="chart-latency"></canvas></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <div class="eyebrow">Usage</div>
+                <h3>Tokens by provider</h3>
+              </div>
+            </div>
+            <div class="chart"><canvas id="chart-tokens"></canvas></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <div class="eyebrow">Workload</div>
+                <h3>Request / response mix</h3>
+              </div>
+            </div>
+            <div class="chart"><canvas id="chart-kinds"></canvas></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="providers-section" class="section-block" aria-labelledby="providers-title">
+        <div class="section-heading">
+          <div>
+            <div class="eyebrow">Provider fleet</div>
+            <h2 id="providers-title">Health, quotas, and recovery state</h2>
+            <p>Providers are grouped as operational units instead of a single wide status table.</p>
+          </div>
+        </div>
+        <div id="providers" class="provider-grid"></div>
+      </section>
+
+      <section id="routing-section" class="section-block" aria-labelledby="routing-title">
+        <div class="section-heading">
+          <div>
+            <div class="eyebrow">Routing policy</div>
+            <h2 id="routing-title">Eligibility and model inventory</h2>
+            <p>See which routes can currently receive automatic traffic and why others are excluded.</p>
+          </div>
+        </div>
+
+        <div class="dashboard-grid routing-grid">
+          <article class="panel span-2">
+            <div class="panel-heading">
+              <div>
+                <div class="eyebrow">Decision matrix</div>
+                <h3>Route ranking</h3>
+              </div>
+              <div id="matrix-count" class="panel-meta"></div>
+            </div>
+            <div class="table-wrap">
+              <table id="matrix">
+                <thead>
+                  <tr>
+                    <th>Provider</th><th>Class</th><th>Static</th><th>Dynamic</th><th>State</th><th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel model-panel">
+            <div class="panel-heading">
+              <div>
+                <div class="eyebrow">Catalog</div>
+                <h3>Advertised models</h3>
+              </div>
+              <div id="model-count" class="panel-meta"></div>
+            </div>
+            <div id="models" class="model-list"></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="analytics-section" class="section-block" aria-labelledby="analytics-title">
+        <div class="section-heading">
+          <div>
+            <div class="eyebrow">Analytics</div>
+            <h2 id="analytics-title">Efficiency and reliability</h2>
+            <p>Cost, success, failover, and workload signals are grouped by the decisions they help you make.</p>
+          </div>
+        </div>
+
+        <div id="analytics-alerts" class="alert-stack"></div>
+        <div id="analytics-summary" class="metric-grid compact"></div>
+
+        <div class="dashboard-grid analytics-grid">
+          <article class="panel">
+            <div class="panel-heading"><div><div class="eyebrow">Spend</div><h3>Estimated cost</h3></div></div>
+            <div class="chart"><canvas id="chart-cost"></canvas></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><div class="eyebrow">Reliability</div><h3>Success rate</h3></div></div>
+            <div class="chart"><canvas id="chart-success"></canvas></div>
+          </article>
+          <article class="panel span-2">
+            <div class="panel-heading"><div><div class="eyebrow">History</div><h3>Attempts, failures, and failovers</h3></div></div>
+            <div class="chart chart-large"><canvas id="chart-activity"></canvas></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><div class="eyebrow">Events</div><h3>Error levels</h3></div></div>
+            <div class="chart"><canvas id="chart-errors"></canvas></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><div class="eyebrow">Classification</div><h3>Task kinds</h3></div></div>
+            <div class="chart"><canvas id="chart-tasks"></canvas></div>
+          </article>
+          <article class="panel span-2">
+            <div class="panel-heading"><div><div class="eyebrow">Provider economics</div><h3>Performance by provider</h3></div></div>
+            <div class="table-wrap">
+              <table id="analytics-providers">
+                <thead>
+                  <tr><th>Provider</th><th>Attempts</th><th>Success</th><th>Failover</th><th>Tokens</th><th>Estimated cost</th></tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="activity-section" class="section-block" aria-labelledby="activity-title">
+        <div class="section-heading">
+          <div>
+            <div class="eyebrow">Live activity</div>
+            <h2 id="activity-title">Recent routing decisions</h2>
+            <p>The latest provider selections and failovers, ordered newest first.</p>
+          </div>
+          <a class="button button-secondary" href="/logs">Explore full logs</a>
+        </div>
+
+        <article class="panel activity-panel">
+          <div class="table-wrap">
+            <table id="events">
+              <thead>
+                <tr><th>Time</th><th>Route</th><th>Mode</th><th>Result</th><th>Tokens</th><th>Latency</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+    </main>
   </div>
-</header>
+</div>
 
-<section class="cards" id="summary"></section>
-
-<section class="panel">
-  <h2>Traffic</h2>
-  <div class="chart-row">
-    <div class="chart-box"><h3>Calls per day</h3><canvas id="chart-calls"></canvas></div>
-    <div class="chart-box"><h3>Tokens per day</h3><canvas id="chart-tokens"></canvas></div>
-    <div class="chart-box"><h3>Latency p50 (ms)</h3><canvas id="chart-latency"></canvas></div>
-  </div>
-  <div class="range">
-    <label>Days: <select id="days">
-      <option value="7">7</option>
-      <option value="30">30</option>
-      <option value="90">90</option>
-    </select></label>
-  </div>
-</section>
-
-<section class="panel">
-  <h2>Providers</h2>
-  <table id="providers">
-    <thead>
-      <tr>
-        <th>Provider</th><th>Status</th><th>Models</th>
-        <th>Calls used / remaining</th><th>Tokens used / remaining</th>
-        <th>Rate limit</th><th>Latency p50/p99</th><th>Last error</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  </table>
-</section>
-
-<section class="panel">
-  <h2>Routing matrix</h2>
-  <table id="matrix">
-    <thead>
-      <tr>
-        <th>Provider</th><th>Free class</th><th>Static</th><th>Dynamic</th>
-        <th>Eligible</th><th>Reasons</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  </table>
-</section>
-
-<section class="panel">
-  <h2>Models</h2>
-  <table id="models">
-    <thead><tr><th>ID</th><th>Owned by</th></tr></thead>
-    <tbody></tbody>
-  </table>
-</section>
-
-<section class="panel">
-  <h2>Request kinds</h2>
-  <div class="kind-grid"><div id="kind-chart"><canvas id="chart-kinds"></canvas></div></div>
-</section>
-
-<section class="panel">
-  <h2>Analytics</h2>
-  <div id="analytics-alerts" class="alert-list"></div>
-  <section class="cards compact" id="analytics-summary"></section>
-  <div class="chart-row">
-    <div class="chart-box"><h3>Estimated cost by provider</h3><canvas id="chart-cost"></canvas></div>
-    <div class="chart-box"><h3>Success rate by provider</h3><canvas id="chart-success"></canvas></div>
-  </div>
-  <div class="chart-row">
-    <div class="chart-box"><h3>Traffic over time</h3><canvas id="chart-activity"></canvas></div>
-    <div class="chart-box"><h3>Error levels</h3><canvas id="chart-errors"></canvas></div>
-  </div>
-  <div class="chart-row">
-    <div class="chart-box"><h3>Task kinds</h3><canvas id="chart-tasks"></canvas></div>
-    <div class="chart-box"></div>
-  </div>
-  <table id="analytics-providers">
-    <thead>
-      <tr>
-        <th>Provider</th><th>Attempts</th><th>Success rate</th><th>Failover rate</th>
-        <th>Tokens</th><th>Estimated cost</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  </table>
-</section>
-
-<section class="panel">
-  <h2>Recent routing events</h2>
-  <table id="events">
-    <thead>
-      <tr>
-        <th>Time</th><th>Provider</th><th>Model</th><th>Kind</th><th>Response</th>
-        <th>Stream/Explicit</th><th>Failover</th><th>Success</th><th>Tokens</th><th>Latency</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  </table>
-</section>
-
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script src="/static/dashboard.js"></script>
 </body>
 </html>
