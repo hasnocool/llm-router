@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Replaced one-failure provider blocking with a three-failure threshold, exponential automatic-routing backoff, immediate rate-limit cooldown, and success-based self-healing.
 - Fixed streaming requests that aborted when a provider returned an error status mid-stream (e.g. Groq HTTP 413): the router now reads the error body safely and emits a clean SSE error instead of crashing the connection.
 - Treated HTTP 413 (payload too large) as retryable so zero-cost routing fails over to the next provider whose context window fits the request.
 - Sanitized Gemini function-declaration schemas so OpenAI-compatible clients' JSON-Schema keywords (`$schema`, `title`, `const`, `additionalProperties`, ...) no longer break tool calls.

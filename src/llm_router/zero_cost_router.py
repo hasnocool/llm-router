@@ -62,10 +62,7 @@ class ZeroCostModelRouter(ModelRouter):
         if self.settings.strategy != "zero-cost":
             return super()._order(req)
 
-        colon_provider = req.model.partition(":")[0] if ":" in req.model else None
-        explicit = req.provider or (
-            colon_provider if normalize_provider(colon_provider) in self.providers else None
-        )
+        explicit = self._explicit_provider(req)
         if explicit:
             return super()._order(req)
 
@@ -152,10 +149,7 @@ class ZeroCostModelRouter(ModelRouter):
         if self.settings.strategy != "zero-cost":
             return super()._order(req)
 
-        colon_provider = req.model.partition(":")[0] if ":" in req.model else None
-        explicit = req.provider or (
-            colon_provider if normalize_provider(colon_provider) in self.providers else None
-        )
+        explicit = self._explicit_provider(req)
         if explicit:
             return super()._order(req)
 
@@ -500,13 +494,10 @@ class ZeroCostModelRouter(ModelRouter):
         status = self.status.get(name)
         if status is None:
             return
-        status.last_error = str(exc)[:200]
-        status.last_polled = time.time()
+        self._mark_provider_failure(name, exc)
         if exc.status_code == 429:
             status.rate_limit_remaining = 0
             status.rate_limit_reset = exc.retry_after_until
-        else:
-            status.available = False
 
     def provider_matrix_view(self) -> list[dict]:
         scores = {score.provider: score for score in self.route_scores()}
