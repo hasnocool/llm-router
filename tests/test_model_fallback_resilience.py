@@ -185,30 +185,23 @@ async def test_provider_failure_counts_once_even_with_multiple_models(tmp_path) 
         await router._metrics_store.close()
 
 
-def test_soft_backoff_waits_for_five_provider_failures(tmp_path) -> None:
-    with httpx.Client() as _unused:
-        pass
-
-    async def run() -> None:
-        async with httpx.AsyncClient() as client:
-            router = ZeroCostModelRouter(_settings(tmp_path), client)
-            router._mark_provider_success("groq", 1.0)
-            error = ProviderUnavailable("temporary", status_code=503)
-            for _ in range(4):
-                router._mark_provider_failure("groq", error)
-            status = router.status["groq"]
-            assert status.available is True
-            assert status.backoff_until == 0.0
-
-            before = time.time()
+async def test_soft_backoff_waits_for_five_provider_failures(tmp_path) -> None:
+    async with httpx.AsyncClient() as client:
+        router = ZeroCostModelRouter(_settings(tmp_path), client)
+        router._mark_provider_success("groq", 1.0)
+        error = ProviderUnavailable("temporary", status_code=503)
+        for _ in range(4):
             router._mark_provider_failure("groq", error)
-            assert status.available is False
-            assert status.backoff_until >= before + 110
-            assert status.backoff_until <= before + 130
-            await router._metrics_store.close()
+        status = router.status["groq"]
+        assert status.available is True
+        assert status.backoff_until == 0.0
 
-    import asyncio
-    asyncio.run(run())
+        before = time.time()
+        router._mark_provider_failure("groq", error)
+        assert status.available is False
+        assert status.backoff_until >= before + 110
+        assert status.backoff_until <= before + 130
+        await router._metrics_store.close()
 
 
 async def test_stream_never_fails_over_after_emitting_data(tmp_path) -> None:
